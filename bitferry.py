@@ -131,18 +131,29 @@ def get_local_ip():
     return ip
 
 
-def get_broadcast_addrs(local_ip):
-    """返回广播地址列表: 全网广播 + 子网定向广播(兼容 Windows 防火墙)。"""
-    addrs = ["255.255.255.255"]
+def get_broadcast_addrs():
+    """所有本机接口的子网广播地址列表（兼容多网卡 + 修复 Windows 防火墙拦截广播）。
+    同时覆盖 255.255.255.255 和每张网卡对应的 x.x.x.255 定向广播。"""
+    addrs = {"255.255.255.255"}
+    ips = set()
+    # 1. 通过 getaddrinfo 获取本机所有 IPv4 地址（覆盖多网卡）
     try:
-        parts = local_ip.split(".")
-        if len(parts) == 4:
-            subnet_bcast = f"{parts[0]}.{parts[1]}.{parts[2]}.255"
-            if subnet_bcast != "255.255.255.255":
-                addrs.append(subnet_bcast)
+        for info in socket.getaddrinfo(socket.gethostname(), None):
+            if info[0] == socket.AF_INET:
+                ips.add(info[4][0])
     except Exception:
         pass
-    return addrs
+    # 2. 主路由 IP 兜底
+    ips.add(get_local_ip())
+    # 3. 每个 IP 对应的 /24 子网广播
+    for ip in ips:
+        if ip.startswith("127.") or ip == "0.0.0.0":
+            continue
+        parts = ip.split(".")
+        if len(parts) == 4:
+            bcast = f"{parts[0]}.{parts[1]}.{parts[2]}.255"
+            addrs.add(bcast)
+    return list(addrs)
 
 
 def _try_open_win_firewall():
@@ -312,6 +323,13 @@ class Discovery:
         self.lock = threading.Lock()
         self.running = True
         self.local_ip = get_local_ip()
+        self._reply_times = {}   # ip -> 上次单播回应时间，用于限速
+
+    def _make_msg(self):
+        return json.dumps({
+            "type": "announce", "name": self.hostname,
+            "ip": self.local_ip, "port": TRANSFER_PORT,
+        }).encode("utf-8")
 
     def start(self):
         threading.Thread(target=self._broadcaster, daemon=True).start()
@@ -321,20 +339,56 @@ class Discovery:
     def stop(self):
         self.running = False
 
+    def ping_known(self, ips):
+        """启动后向所有历史已知设备单播 announce，加速初始发现（尤其 Windows 防火墙场景）。"""
+        def _do():
+            time.sleep(0.8)   # 等 listener 线程就绪
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                msg = self._make_msg()
+                for ip in ips:
+                    if ip != self.local_ip:
+                        try:
+                            s.sendto(msg, (ip, DISCOVERY_PORT))
+                        except Exception:
+                            pass
+                s.close()
+            except Exception:
+                pass
+        threading.Thread(target=_do, daemon=True).start()
+
     def force_broadcast(self):
-        """立即发送一次广播，用于手动刷新设备列表。"""
+        """立即广播 + 单播到所有当前已知对端（刷新按钮触发）。"""
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            msg = json.dumps({
-                "type": "announce", "name": self.hostname,
-                "ip": self.local_ip, "port": TRANSFER_PORT,
-            }).encode("utf-8")
-            for addr in get_broadcast_addrs(self.local_ip):
+            msg = self._make_msg()
+            for addr in get_broadcast_addrs():
                 try:
                     s.sendto(msg, (addr, DISCOVERY_PORT))
                 except Exception:
                     pass
+            with self.lock:
+                peer_ips = list(self.peers.keys())
+            for ip in peer_ips:
+                try:
+                    s.sendto(msg, (ip, DISCOVERY_PORT))
+                except Exception:
+                    pass
+            s.close()
+        except Exception:
+            pass
+
+    def _unicast_reply(self, target_ip):
+        """收到对端广播后，向其 IP 单播一次 announce。
+        Windows 防火墙通常允许单播到已绑定端口，但会拦截入站广播。"""
+        now = time.time()
+        if now - self._reply_times.get(target_ip, 0) < BROADCAST_INTERVAL:
+            return   # 限速：避免每 2 秒都发一次
+        self._reply_times[target_ip] = now
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.sendto(self._make_msg(), (target_ip, DISCOVERY_PORT))
             s.close()
         except Exception:
             pass
@@ -342,11 +396,8 @@ class Discovery:
     def _broadcaster(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        msg = json.dumps({
-            "type": "announce", "name": self.hostname,
-            "ip": self.local_ip, "port": TRANSFER_PORT,
-        }).encode("utf-8")
-        bcast_addrs = get_broadcast_addrs(self.local_ip)
+        bcast_addrs = get_broadcast_addrs()
+        msg = self._make_msg()
         while self.running:
             for addr in bcast_addrs:
                 try:
@@ -358,7 +409,7 @@ class Discovery:
     def _listener(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)  # 接收广播包(Windows 必需)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)  # Windows 接收广播包必需
         try:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         except (AttributeError, OSError):
@@ -381,6 +432,9 @@ class Discovery:
                         "last": time.time(),
                     }
                 self.on_peers_change(self.snapshot())
+                # 关键：单播回应对端，让对端即使收不到广播也能发现我们
+                threading.Thread(target=self._unicast_reply, args=(ip,),
+                                 daemon=True).start()
             except socket.timeout:
                 continue
             except Exception:
@@ -1358,6 +1412,8 @@ class MainWindow(QMainWindow):
         self.discovery = Discovery(
             self.hostname, lambda p: self.signals.peers_changed.emit(p))
         self.discovery.start()
+        # 向历史已知设备发单播，加速双向发现（解决 Windows 防火墙拦截广播的问题）
+        self.discovery.ping_known(list(self.known.keys()))
         self.receiver = Receiver(
             on_file=self._on_file_received,
             on_chat=lambda n, ip, k, p: self.signals.chat_in.emit(n, ip, k, p),
