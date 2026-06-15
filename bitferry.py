@@ -120,22 +120,49 @@ ACCENT = "#5B8CFF"
 
 
 # ----------------------------- 工具函数 -----------------------------
-def get_local_ip():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+def _is_vpn_ip(ip):
+    """检测已知 VPN/隧道专用 IP 段，这些 IP 不应作为 LAN 通信地址。
+    198.18/15 = IANA benchmark（Clash/mihomo TUN 默认）
+    100.64/10 = CGNAT（Tailscale / ZeroTier）
+    169.254/16 = Link-local / APIPA（Windows 无 DHCP 时的自动分配）"""
     try:
+        a, b = [int(x) for x in ip.split(".")[:2]]
+        if a == 198 and b in (18, 19):   return True
+        if a == 100 and 64 <= b <= 127:  return True
+        if a == 169 and b == 254:        return True
+    except Exception:
+        pass
+    return False
+
+
+def get_local_ip():
+    """优先返回真实 LAN IP。VPN 占据默认路由时，自动回落到枚举所有网卡找第一个非 VPN IP。"""
+    # 先按默认路由获取
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
         ip = s.getsockname()[0]
-    except Exception:
-        ip = "127.0.0.1"
-    finally:
         s.close()
-    return ip
+        if ip and not ip.startswith("127.") and not _is_vpn_ip(ip):
+            return ip
+        vpn_fallback = ip   # 记下，若找不到真实 LAN IP 再用
+    except Exception:
+        vpn_fallback = "127.0.0.1"
+    # 默认路由是 VPN IP —— 枚举网卡找真实 LAN IP
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None):
+            if info[0] != socket.AF_INET:
+                continue
+            ip = info[4][0]
+            if ip and not ip.startswith("127.") and ip != "0.0.0.0" and not _is_vpn_ip(ip):
+                return ip
+    except Exception:
+        pass
+    return vpn_fallback
 
 
-def get_broadcast_addrs():
-    """所有本机接口的子网广播地址 + 用户自定义网段。
-    覆盖 255.255.255.255、每张网卡的 x.x.x.255、以及用户在「网段设置」里手动添加的网段。"""
-    addrs = {"255.255.255.255"}
+def _all_machine_ips():
+    """返回本机所有 IPv4 地址（含 VPN），供 Discovery 过滤自身广播用。"""
     ips = set()
     try:
         for info in socket.getaddrinfo(socket.gethostname(), None):
@@ -144,13 +171,18 @@ def get_broadcast_addrs():
     except Exception:
         pass
     ips.add(get_local_ip())
-    for ip in ips:
-        if ip.startswith("127.") or ip == "0.0.0.0":
+    return ips
+
+
+def get_broadcast_addrs():
+    """所有真实 LAN 网卡的子网广播地址 + 用户自定义网段（跳过 VPN IP）。"""
+    addrs = {"255.255.255.255"}
+    for ip in _all_machine_ips():
+        if ip.startswith("127.") or ip == "0.0.0.0" or _is_vpn_ip(ip):
             continue
         parts = ip.split(".")
         if len(parts) == 4:
             addrs.add(f"{parts[0]}.{parts[1]}.{parts[2]}.255")
-    # 用户自定义网段（settings.json 的 extra_subnets 列表）
     for subnet in get_setting("extra_subnets", []):
         subnet = subnet.strip()
         if subnet:
@@ -324,15 +356,39 @@ class Discovery:
         self.peers = {}
         self.lock = threading.Lock()
         self.running = True
-        self.local_ip = get_local_ip()
-        self._reply_times = {}   # ip -> 上次单播回应时间，用于限速
+        self.local_ip = get_local_ip()   # 主 LAN IP（已过滤 VPN）
+        self._reply_times = {}           # ip -> 上次单播回应时间，用于限速
 
-    def _make_msg(self):
+    # ---- 多网卡/VPN 感知 ----
+    def _all_ips(self):
+        """本机所有 IPv4（含 VPN），用于过滤自身广播。"""
+        return _all_machine_ips()
+
+    def _lan_ips(self):
+        """只返回真实 LAN IP（跳过 VPN/隧道地址），用于 announce。"""
+        result = [ip for ip in self._all_ips()
+                  if not ip.startswith("127.") and ip != "0.0.0.0" and not _is_vpn_ip(ip)]
+        return result or [self.local_ip]
+
+    def _best_announce_ip(self, target_ip=None):
+        """选最合适的本机 LAN IP 来 announce（优先与 target 同 /24 子网）。"""
+        lan = self._lan_ips()
+        if target_ip:
+            prefix = ".".join(target_ip.split(".")[:3])
+            for ip in lan:
+                if ".".join(ip.split(".")[:3]) == prefix:
+                    return ip
+        return lan[0] if lan else self.local_ip
+
+    def _make_msg(self, lan_ip=None):
+        if lan_ip is None:
+            lan_ip = self._best_announce_ip()
         return json.dumps({
             "type": "announce", "name": self.hostname,
-            "ip": self.local_ip, "port": TRANSFER_PORT,
+            "ip": lan_ip, "port": TRANSFER_PORT,
         }).encode("utf-8")
 
+    # ---- 生命周期 ----
     def start(self):
         threading.Thread(target=self._broadcaster, daemon=True).start()
         threading.Thread(target=self._listener, daemon=True).start()
@@ -341,17 +397,19 @@ class Discovery:
     def stop(self):
         self.running = False
 
+    # ---- 主动发现 ----
     def ping_known(self, ips):
-        """启动后向所有历史已知设备单播 announce，加速初始发现（尤其 Windows 防火墙场景）。"""
+        """启动后向历史已知设备单播，加速初始发现（含 Windows 防火墙场景）。"""
         def _do():
-            time.sleep(0.8)   # 等 listener 线程就绪
+            time.sleep(0.8)
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                msg = self._make_msg()
+                all_mine = self._all_ips()
                 for ip in ips:
-                    if ip != self.local_ip:
+                    if ip not in all_mine:
                         try:
-                            s.sendto(msg, (ip, DISCOVERY_PORT))
+                            s.sendto(self._make_msg(self._best_announce_ip(ip)),
+                                     (ip, DISCOVERY_PORT))
                         except Exception:
                             pass
                 s.close()
@@ -364,53 +422,72 @@ class Discovery:
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            msg = self._make_msg()
-            for addr in get_broadcast_addrs():
-                try:
-                    s.sendto(msg, (addr, DISCOVERY_PORT))
-                except Exception:
-                    pass
+            # 每个 LAN IP 各自广播
+            for lan_ip in self._lan_ips():
+                msg = self._make_msg(lan_ip)
+                for addr in get_broadcast_addrs():
+                    try:
+                        s.sendto(msg, (addr, DISCOVERY_PORT))
+                    except Exception:
+                        pass
+            # 单播到已知对端
             with self.lock:
                 peer_ips = list(self.peers.keys())
+            all_mine = self._all_ips()
             for ip in peer_ips:
-                try:
-                    s.sendto(msg, (ip, DISCOVERY_PORT))
-                except Exception:
-                    pass
+                if ip not in all_mine:
+                    try:
+                        s.sendto(self._make_msg(self._best_announce_ip(ip)),
+                                 (ip, DISCOVERY_PORT))
+                    except Exception:
+                        pass
             s.close()
         except Exception:
             pass
 
     def _unicast_reply(self, target_ip):
-        """收到对端广播后，向其 IP 单播一次 announce。
-        Windows 防火墙通常允许单播到已绑定端口，但会拦截入站广播。"""
+        """收到对端广播后，单播回应，穿透 Windows 防火墙。"""
         now = time.time()
         if now - self._reply_times.get(target_ip, 0) < BROADCAST_INTERVAL:
-            return   # 限速：避免每 2 秒都发一次
+            return
         self._reply_times[target_ip] = now
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.sendto(self._make_msg(), (target_ip, DISCOVERY_PORT))
+            # 选与 target 同子网的本机 IP 来 announce，对方能直接回连
+            s.sendto(self._make_msg(self._best_announce_ip(target_ip)),
+                     (target_ip, DISCOVERY_PORT))
             s.close()
         except Exception:
             pass
 
     def _broadcaster(self):
+        """每个真实 LAN IP 分别广播 announce，VPN 开启时依然能发现对端。"""
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        msg = self._make_msg()
         while self.running:
-            for addr in get_broadcast_addrs():   # 每轮重新读，用户修改设置后立即生效
-                try:
-                    s.sendto(msg, (addr, DISCOVERY_PORT))
-                except Exception:
-                    pass
+            extra_subnets = get_setting("extra_subnets", [])
+            for lan_ip in self._lan_ips():   # 每轮重新枚举，自动感知 VPN 状态变化
+                msg = self._make_msg(lan_ip)
+                # 该网卡的子网广播 + 全网广播
+                parts = lan_ip.split(".")
+                targets = {"255.255.255.255"}
+                if len(parts) == 4:
+                    targets.add(f"{parts[0]}.{parts[1]}.{parts[2]}.255")
+                for sub in extra_subnets:
+                    sub = sub.strip()
+                    if sub:
+                        targets.add(f"{sub}.255")
+                for addr in targets:
+                    try:
+                        s.sendto(msg, (addr, DISCOVERY_PORT))
+                    except Exception:
+                        pass
             time.sleep(BROADCAST_INTERVAL)
 
     def _listener(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)  # Windows 接收广播包必需
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         try:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         except (AttributeError, OSError):
@@ -424,7 +501,7 @@ class Discovery:
                 if info.get("type") != "announce":
                     continue
                 ip = info.get("ip", addr[0])
-                if ip == self.local_ip:
+                if ip in self._all_ips():   # 过滤自身所有 IP（含 VPN IP）
                     continue
                 with self.lock:
                     self.peers[ip] = {
@@ -433,7 +510,6 @@ class Discovery:
                         "last": time.time(),
                     }
                 self.on_peers_change(self.snapshot())
-                # 关键：单播回应对端，让对端即使收不到广播也能发现我们
                 threading.Thread(target=self._unicast_reply, args=(ip,),
                                  daemon=True).start()
             except socket.timeout:
