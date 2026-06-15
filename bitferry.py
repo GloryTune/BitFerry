@@ -131,6 +131,38 @@ def get_local_ip():
     return ip
 
 
+def get_broadcast_addrs(local_ip):
+    """返回广播地址列表: 全网广播 + 子网定向广播(兼容 Windows 防火墙)。"""
+    addrs = ["255.255.255.255"]
+    try:
+        parts = local_ip.split(".")
+        if len(parts) == 4:
+            subnet_bcast = f"{parts[0]}.{parts[1]}.{parts[2]}.255"
+            if subnet_bcast != "255.255.255.255":
+                addrs.append(subnet_bcast)
+    except Exception:
+        pass
+    return addrs
+
+
+def _try_open_win_firewall():
+    """Windows: 静默尝试添加防火墙入站规则，失败则忽略(需要管理员时跳过)。"""
+    if platform.system() != "Windows":
+        return
+    try:
+        exe = sys.executable
+        for proto, port in [("UDP", DISCOVERY_PORT), ("TCP", TRANSFER_PORT)]:
+            name = f"BitFerry-{proto}-{port}"
+            subprocess.run(
+                ["netsh", "advfirewall", "firewall", "add", "rule",
+                 f"name={name}", "dir=in", "action=allow",
+                 f"protocol={proto}", f"localport={port}",
+                 f"program={exe}", "enable=yes"],
+                capture_output=True, timeout=5)
+    except Exception:
+        pass
+
+
 def get_hostname():
     return socket.gethostname()
 
@@ -298,7 +330,11 @@ class Discovery:
                 "type": "announce", "name": self.hostname,
                 "ip": self.local_ip, "port": TRANSFER_PORT,
             }).encode("utf-8")
-            s.sendto(msg, ("255.255.255.255", DISCOVERY_PORT))
+            for addr in get_broadcast_addrs(self.local_ip):
+                try:
+                    s.sendto(msg, (addr, DISCOVERY_PORT))
+                except Exception:
+                    pass
             s.close()
         except Exception:
             pass
@@ -310,16 +346,19 @@ class Discovery:
             "type": "announce", "name": self.hostname,
             "ip": self.local_ip, "port": TRANSFER_PORT,
         }).encode("utf-8")
+        bcast_addrs = get_broadcast_addrs(self.local_ip)
         while self.running:
-            try:
-                s.sendto(msg, ("255.255.255.255", DISCOVERY_PORT))
-            except Exception:
-                pass
+            for addr in bcast_addrs:
+                try:
+                    s.sendto(msg, (addr, DISCOVERY_PORT))
+                except Exception:
+                    pass
             time.sleep(BROADCAST_INTERVAL)
 
     def _listener(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)  # 接收广播包(Windows 必需)
         try:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         except (AttributeError, OSError):
@@ -1466,12 +1505,27 @@ class MainWindow(QMainWindow):
         rc.addLayout(rcbtns)
         sb.addWidget(recvCard)
 
-        sb.addWidget(self._lbl("设备", "sectionLabel"))
+        # 设备栏标题行 + 刷新按钮
+        dev_hdr = QHBoxLayout()
+        dev_hdr.setSpacing(6)
+        dev_hdr.addWidget(self._lbl("设备", "sectionLabel"))
+        dev_hdr.addStretch()
+        self.btn_refresh = QPushButton("刷新")
+        self.btn_refresh.setObjectName("miniBtn")
+        self.btn_refresh.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_refresh.setToolTip("重新扫描局域网设备")
+        self.btn_refresh.clicked.connect(self.action_refresh_devices)
+        dev_hdr.addWidget(self.btn_refresh)
+        sb.addLayout(dev_hdr)
+
         self.peer_list = QListWidget()
         self.peer_list.currentItemChanged.connect(self._on_peer_selected)
+        self.peer_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.peer_list.customContextMenuRequested.connect(self._peer_context_menu)
+        self.peer_list.setToolTip("右键点击离线设备可将其删除")
         sb.addWidget(self.peer_list, 1)
 
-        self.empty_hint = self._lbl("尚未发现设备\n确保对方也打开了 LanTong", "emptyHint")
+        self.empty_hint = self._lbl("尚未发现设备\n确保对方也打开了 BitFerry", "emptyHint")
         self.empty_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         sb.addWidget(self.empty_hint)
         outer.addWidget(sidebar)
@@ -1617,7 +1671,7 @@ class MainWindow(QMainWindow):
 
     def _refresh_done(self):
         self.btn_refresh.setEnabled(True)
-        self.btn_refresh.setText("↻ 刷新")
+        self.btn_refresh.setText("刷新")
 
     def _peer_context_menu(self, pos):
         item = self.peer_list.itemAt(pos)
@@ -2157,6 +2211,7 @@ class MainWindow(QMainWindow):
 
 
 def main():
+    _try_open_win_firewall()
     app = QApplication(sys.argv)
     app.setApplicationName("BitFerry")
     f = QFont()
