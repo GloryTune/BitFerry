@@ -6,6 +6,20 @@
 
 ---
 
+## 下载安装（推荐）
+
+**Windows 用户无需安装 Python，下载即用：**
+
+➡️ 前往 [**Releases 页面**](https://github.com/GloryTune/BitFerry/releases/latest) 下载最新的 `BitFerry-windows-x64.exe`，双击运行即可。
+
+- 首次运行若出现 Windows SmartScreen 提示，点「更多信息 → 仍要运行」。
+- 适用于 Windows 10/11 64 位。
+- 请确保防火墙放行 **UDP 50808**（设备发现）与 **TCP 50809**（文件/消息传输）。
+
+> macOS 用户暂无预编译包，请按下文「[快速运行（源码方式）](#快速运行源码方式)」或「[打包为独立应用](#打包为独立应用无需-python-环境)」自行运行/打包。
+
+---
+
 ## 功能特性
 
 - **自动发现设备** — 同一局域网内的设备自动出现在列表中，在线/离线状态实时显示
@@ -93,20 +107,22 @@ dist/BitFerry.app
 
 ### Windows — 打包为 `.exe`
 
-修改 `bitferry.spec`，在 `EXE` 块中将 `console=False` 保持不变，然后在 Windows 机器上执行：
+仓库已提供 Windows 专用打包配置 `bitferry_win.spec`（单文件、无控制台窗口）。在 Windows 机器上执行：
 
 ```bash
 pip install pyinstaller
-pyinstaller bitferry.spec --clean --noconfirm
+pyinstaller bitferry_win.spec --clean --noconfirm
 ```
 
-输出位于 `dist\BitFerry\BitFerry.exe`（连同 `dist\BitFerry\` 文件夹一起分发）。
+打包完成后，单个可执行文件位于：
 
-若需单文件版本，也可直接运行：
-
-```bash
-pyinstaller --onefile --windowed --name BitFerry bitferry.py
 ```
+dist\BitFerry.exe
+```
+
+直接把这个 `BitFerry.exe` 发给别人即可双击运行，无需附带任何其它文件。
+
+> 这正是 [Releases 页面](https://github.com/GloryTune/BitFerry/releases/latest) 中预编译包的构建方式——一般用户直接下载即可，无需自行打包。
 
 ---
 
