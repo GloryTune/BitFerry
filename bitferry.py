@@ -395,13 +395,19 @@ _STYLE_TPL = (
     "QScrollBar::handle:vertical {{ background:{sb}; border-radius:3px; min-height:24px; }}\n"
     "QScrollBar::handle:vertical:hover {{ background:{sb_h}; }}\n"
     "QScrollBar::add-line, QScrollBar::sub-line {{ height:0; }}\n"
-    "#xferBanner {{ background:{xb}; border-bottom:1px solid {panel_border}; }}\n"
+    "#xferBanner {{ background:{s3}; border-top:2px solid {accent}; border-bottom:1px solid {panel_border}; }}\n"
     "#xferIcon {{ color:{accent}; font-size:16px; font-weight:700; }}\n"
     "#xferName {{ color:{t2}; font-size:12px; font-weight:600; }}\n"
     "#xferPct {{ color:{accent}; font-size:11px; font-weight:700; }}\n"
     "#xferSpeed {{ color:{t2}; font-size:11px; }}\n"
     "QProgressBar#xferBar {{ background:{s2}; border:none; border-radius:2px; }}\n"
     "QProgressBar#xferBar::chunk {{ background:{accent}; border-radius:2px; }}\n"
+    "QPushButton#xferBtnPause {{ background:{accent}; color:#FFFFFF; border:none;"
+        " border-radius:4px; padding:2px 8px; font-size:12px; font-weight:600; }}\n"
+    "QPushButton#xferBtnPause:hover {{ background:{accent_hover}; }}\n"
+    "QPushButton#xferBtnCancel {{ background:{warn}; color:#FFFFFF; border:none;"
+        " border-radius:4px; padding:2px 8px; font-size:12px; font-weight:600; }}\n"
+    "QPushButton#xferBtnCancel:hover {{ opacity:0.85; }}\n"
     "#recvPendingBanner {{ background:{pb}; border-bottom:1px solid {pb_b}; }}\n"
     "#recvPendingText {{ color:{t1}; font-size:12px; font-weight:600; }}\n"
     "QPushButton#acceptBtn {{ background:{success}; color:#FFFFFF; border:none;"
@@ -1574,19 +1580,101 @@ class FileCard(QFrame):
         """获取操作系统原生文件类型图标。"""
         try:
             from PyQt6.QtWidgets import QFileIconProvider
-            from PyQt6.QtCore import QFileInfo
+            from PyQt6.QtCore import QFileInfo, Qt
             provider = QFileIconProvider()
-            # 文件/文件夹存在时直接获取系统图标（最准确）
-            if path and os.path.exists(path):
-                return provider.icon(QFileInfo(path)).pixmap(32, 32)
-            # 不存在时用文件名后缀推断（接收方在传输完成前也能显示正确图标）
-            dummy = QFileInfo(name or "file.bin")
-            pix = provider.icon(dummy).pixmap(32, 32)
-            if not pix.isNull():
-                return pix
-            return provider.icon(QFileIconProvider.IconType.File).pixmap(32, 32)
+            target = path if (path and os.path.exists(path)) else None
+            icon = provider.icon(QFileInfo(target or name or "file.bin"))
+            # 尝试多种尺寸：Windows HiDPI 下 pixmap(32,32) 可能返回空
+            for sz in (32, 48, 16, 64):
+                pix = icon.pixmap(sz, sz)
+                if not pix.isNull():
+                    if sz != 32:
+                        pix = pix.scaled(32, 32, Qt.AspectRatioMode.KeepAspectRatio,
+                                         Qt.TransformationMode.SmoothTransformation)
+                    return pix
+            # Windows 兜底：通过 Win32 SHGetFileInfoW 直接获取图标
+            if platform.system() == "Windows":
+                pix = FileCard._win_ctypes_icon(target or name or "file.bin")
+                if pix and not pix.isNull():
+                    return pix
+            pix = provider.icon(QFileIconProvider.IconType.File).pixmap(32, 32)
+            return pix if not pix.isNull() else QPixmap()
         except Exception:
             return QPixmap()
+
+    @staticmethod
+    def _win_ctypes_icon(path: str) -> "QPixmap | None":
+        """Windows: 用 Win32 SHGetFileInfoW 获取文件图标并转为 QPixmap（绕过 Qt 图标提供器）。"""
+        try:
+            import ctypes
+            import ctypes.wintypes as wt
+            SHGFI_ICON = 0x100
+            SHGFI_LARGEICON = 0x0
+            SHGFI_USEFILEATTRIBUTES = 0x10
+            FILE_ATTRIBUTE_NORMAL = 0x80
+
+            class SHFILEINFO(ctypes.Structure):
+                _fields_ = [("hIcon", wt.HANDLE), ("iIcon", ctypes.c_int),
+                             ("dwAttributes", wt.DWORD),
+                             ("szDisplayName", ctypes.c_wchar * 260),
+                             ("szTypeName", ctypes.c_wchar * 80)]
+
+            info = SHFILEINFO()
+            ret = ctypes.windll.shell32.SHGetFileInfoW(
+                path, FILE_ATTRIBUTE_NORMAL, ctypes.byref(info), ctypes.sizeof(info),
+                SHGFI_ICON | SHGFI_LARGEICON | SHGFI_USEFILEATTRIBUTES)
+            if not ret or not info.hIcon:
+                return None
+
+            size = 32
+            user32, gdi32 = ctypes.windll.user32, ctypes.windll.gdi32
+            hdc_screen = user32.GetDC(None)
+            hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
+
+            class BITMAPINFOHEADER(ctypes.Structure):
+                _fields_ = [("biSize", wt.DWORD), ("biWidth", ctypes.c_long),
+                             ("biHeight", ctypes.c_long), ("biPlanes", wt.WORD),
+                             ("biBitCount", wt.WORD), ("biCompression", wt.DWORD),
+                             ("biSizeImage", wt.DWORD), ("biXPelsPerMeter", ctypes.c_long),
+                             ("biYPelsPerMeter", ctypes.c_long),
+                             ("biClrUsed", wt.DWORD), ("biClrImportant", wt.DWORD)]
+
+            class BITMAPINFO(ctypes.Structure):
+                _fields_ = [("bmiHeader", BITMAPINFOHEADER), ("bmiColors", wt.DWORD * 3)]
+
+            bmi = BITMAPINFO()
+            bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+            bmi.bmiHeader.biWidth = size
+            bmi.bmiHeader.biHeight = -size  # top-down DIB
+            bmi.bmiHeader.biPlanes = 1
+            bmi.bmiHeader.biBitCount = 32
+            bmi.bmiHeader.biCompression = 0  # BI_RGB
+
+            p_bits = ctypes.c_void_p()
+            hbm = gdi32.CreateDIBSection(hdc_mem, ctypes.byref(bmi), 0,
+                                          ctypes.byref(p_bits), None, 0)
+            old_bm = gdi32.SelectObject(hdc_mem, hbm)
+            user32.DrawIconEx(hdc_mem, 0, 0, info.hIcon, size, size, 0, None, 3)  # DI_NORMAL
+
+            buf = (ctypes.c_ubyte * (size * size * 4))()
+            ctypes.memmove(buf, p_bits, size * size * 4)
+
+            gdi32.SelectObject(hdc_mem, old_bm)
+            gdi32.DeleteDC(hdc_mem)
+            user32.ReleaseDC(None, hdc_screen)
+            gdi32.DeleteObject(hbm)
+            user32.DestroyIcon(info.hIcon)
+
+            # GDI BGRA → Qt RGBA
+            data = bytearray(buf)
+            for i in range(0, len(data), 4):
+                data[i], data[i + 2] = data[i + 2], data[i]
+
+            from PyQt6.QtGui import QImage, QPixmap
+            img = QImage(bytes(data), size, size, size * 4, QImage.Format.Format_RGBA8888)
+            return QPixmap.fromImage(img)
+        except Exception:
+            return None
 
     def _unregister(self):
         try:
@@ -1602,6 +1690,8 @@ class FileCard(QFrame):
         self.update()
 
     def set_done(self):
+        # Windows 的 SHGetFileInfo 需要真实文件才能返回正确图标，传输完成后文件已存在，重新加载
+        self._icon_pix = FileCard._load_icon(self.path, self._fname)
         self._transferring = False
         self._progress = 1.0
         self._speed = 0.0
@@ -2260,17 +2350,19 @@ class TransferProgressWidget(QFrame):
         lay.addWidget(self.speed_lbl)
 
         # 暂停/继续 + 取消 按钮（仅发送时显示）
-        self._btn_pause = QPushButton("⏸")
-        self._btn_pause.setObjectName("tool")
-        self._btn_pause.setFixedSize(28, 28)
+        self._btn_pause = QPushButton("⏸ 暂停")
+        self._btn_pause.setObjectName("xferBtnPause")
+        self._btn_pause.setFixedHeight(28)
+        self._btn_pause.setMinimumWidth(64)
         self._btn_pause.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_pause.setToolTip("暂停发送")
         self._btn_pause.clicked.connect(self._on_pause_clicked)
         lay.addWidget(self._btn_pause)
 
-        self._btn_cancel = QPushButton("✕")
-        self._btn_cancel.setObjectName("tool")
-        self._btn_cancel.setFixedSize(28, 28)
+        self._btn_cancel = QPushButton("✕ 取消")
+        self._btn_cancel.setObjectName("xferBtnCancel")
+        self._btn_cancel.setFixedHeight(28)
+        self._btn_cancel.setMinimumWidth(64)
         self._btn_cancel.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_cancel.setToolTip("取消发送")
         self._btn_cancel.clicked.connect(self._on_cancel_clicked)
@@ -2287,12 +2379,12 @@ class TransferProgressWidget(QFrame):
             return
         if self._ctrl.is_paused:
             self._ctrl.resume()
-            self._btn_pause.setText("⏸")
+            self._btn_pause.setText("⏸ 暂停")
             self._btn_pause.setToolTip("暂停发送")
             self.name_lbl.setStyleSheet("")
         else:
             self._ctrl.pause()
-            self._btn_pause.setText("▶")
+            self._btn_pause.setText("▶ 继续")
             self._btn_pause.setToolTip("继续发送")
             self.name_lbl.setStyleSheet(f"color:{_theme_color('warn')};")
 
@@ -2317,7 +2409,7 @@ class TransferProgressWidget(QFrame):
         self._btn_pause.setVisible(show_ctrl)
         self._btn_cancel.setVisible(show_ctrl)
         if show_ctrl:
-            self._btn_pause.setText("⏸")
+            self._btn_pause.setText("⏸ 暂停")
         self.show()
 
     def update_progress(self, done: int, total: int, speed: float):
