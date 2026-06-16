@@ -509,7 +509,8 @@ def _try_open_win_firewall():
 
 
 def get_hostname():
-    return socket.gethostname()
+    custom = get_setting("device_name", "")
+    return custom if custom else socket.gethostname()
 
 
 def safe_folder_name(name):
@@ -753,6 +754,11 @@ class Discovery:
             s.close()
         except Exception:
             pass
+
+    def update_name(self, new_name: str):
+        """更新广播名称并立即重播，让对端即时感知改名。"""
+        self.hostname = new_name
+        threading.Thread(target=self.force_broadcast, daemon=True).start()
 
     def _unicast_reply(self, target_ip):
         """收到对端广播后，单播回应，穿透 Windows 防火墙。"""
@@ -1130,30 +1136,26 @@ def send_file(filepath, peer_ip, peer_port, sender_name, on_log):
         return False
 
 
-def send_batch(items, peer_ip, peer_port, sender_name, on_log, on_progress=None, first_name=""):
+def send_batch(items, peer_ip, peer_port, sender_name, on_log,
+               on_progress=None, first_name="", ctrl: "TransferControl | None" = None):
     """
     一次性发送一批内容(文字/图片/文件)作为单个消息块。
-    items: 列表, 每项形如:
-        {"type":"text", "text":...}
-        {"type":"image", "bytes":b"..."}                       # 内存图片(粘贴/截图)
-        {"type":"image", "path":"..."}                         # 磁盘图片
-        {"type":"file", "path":"...", "relpath":可选}          # 文件
-    协议: header(kind=batch, parts=[...]) + 所有二进制负载顺序拼接
-    on_progress(filename, done_bytes, total_bytes, speed_bps) 每 CHUNK 回调一次
+    ctrl: TransferControl 实例，可在发送途中暂停/取消。
+    on_progress(filename, done_bytes, total_bytes, speed_bps) 每 CHUNK 回调一次。
+    返回 True=完成, False=失败/取消。
     """
     try:
         parts = []
         blobs = []
         blob_names = []
         for it in items:
+            if ctrl and ctrl.is_cancelled:
+                return False
             t = it["type"]
             if t == "text":
                 parts.append({"type": "text", "text": it["text"]})
             elif t == "image":
-                if "bytes" in it:
-                    data = it["bytes"]
-                else:
-                    data = Path(it["path"]).read_bytes()
+                data = it["bytes"] if "bytes" in it else Path(it["path"]).read_bytes()
                 parts.append({"type": "image", "size": len(data)})
                 blobs.append(data)
                 blob_names.append(it.get("path", "image.png"))
@@ -1166,6 +1168,9 @@ def send_batch(items, peer_ip, peer_port, sender_name, on_log, on_progress=None,
                 parts.append(part)
                 blobs.append(data)
                 blob_names.append(p.name)
+
+        if ctrl and ctrl.is_cancelled:
+            return False
 
         header = {"kind": "batch", "sender": sender_name, "parts": parts}
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1185,6 +1190,11 @@ def send_batch(items, peer_ip, peer_port, sender_name, on_log, on_progress=None,
         for blob, bname in zip(blobs, blob_names):
             offset = 0
             while offset < len(blob):
+                if ctrl:
+                    if not ctrl.wait_if_paused():   # 暂停等待，取消返回 False
+                        s.close()
+                        on_log("发送已取消", "info")
+                        return False
                 chunk = blob[offset:offset + CHUNK]
                 s.sendall(chunk)
                 offset += len(chunk)
@@ -1200,6 +1210,40 @@ def send_batch(items, peer_ip, peer_port, sender_name, on_log, on_progress=None,
     except Exception as e:
         on_log(f"批量发送失败: {e}", "error")
         return False
+
+
+# ----------------------------- 传输控制器 -----------------------------
+class TransferControl:
+    """线程安全的发送暂停/取消控制器，由主线程写、发送线程读。"""
+    def __init__(self):
+        self._cancel = threading.Event()
+        self._pause  = threading.Event()
+
+    def cancel(self):
+        self._cancel.set()
+        self._pause.clear()   # 唤醒可能阻塞在暂停里的线程
+
+    def pause(self):
+        self._pause.set()
+
+    def resume(self):
+        self._pause.clear()
+
+    @property
+    def is_cancelled(self) -> bool:
+        return self._cancel.is_set()
+
+    @property
+    def is_paused(self) -> bool:
+        return self._pause.is_set()
+
+    def wait_if_paused(self) -> bool:
+        """暂停时阻塞，返回 False 表示已取消。"""
+        while self._pause.is_set():
+            if self._cancel.is_set():
+                return False
+            time.sleep(0.05)
+        return not self._cancel.is_set()
 
 
 # ----------------------------- Qt 信号桥 -----------------------------
@@ -2184,25 +2228,69 @@ class TransferProgressWidget(QFrame):
 
         self.speed_lbl = QLabel("")
         self.speed_lbl.setObjectName("xferSpeed")
-        self.speed_lbl.setFixedWidth(84)
+        self.speed_lbl.setFixedWidth(72)
         self.speed_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         lay.addWidget(self.speed_lbl)
 
+        # 暂停/继续 + 取消 按钮（仅发送时显示）
+        self._btn_pause = QPushButton("⏸")
+        self._btn_pause.setObjectName("tool")
+        self._btn_pause.setFixedSize(28, 28)
+        self._btn_pause.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_pause.setToolTip("暂停发送")
+        self._btn_pause.clicked.connect(self._on_pause_clicked)
+        lay.addWidget(self._btn_pause)
+
+        self._btn_cancel = QPushButton("✕")
+        self._btn_cancel.setObjectName("tool")
+        self._btn_cancel.setFixedSize(28, 28)
+        self._btn_cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_cancel.setToolTip("取消发送")
+        self._btn_cancel.clicked.connect(self._on_cancel_clicked)
+        lay.addWidget(self._btn_cancel)
+
+        self._ctrl: "TransferControl | None" = None
         self._hide_timer = QTimer(self)
         self._hide_timer.setSingleShot(True)
         self._hide_timer.timeout.connect(self.hide)
         self.hide()
 
-    def start_transfer(self, direction: str, filename: str):
+    def _on_pause_clicked(self):
+        if not self._ctrl:
+            return
+        if self._ctrl.is_paused:
+            self._ctrl.resume()
+            self._btn_pause.setText("⏸")
+            self._btn_pause.setToolTip("暂停发送")
+            self.name_lbl.setStyleSheet("")
+        else:
+            self._ctrl.pause()
+            self._btn_pause.setText("▶")
+            self._btn_pause.setToolTip("继续发送")
+            self.name_lbl.setStyleSheet(f"color:{_theme_color('warn')};")
+
+    def _on_cancel_clicked(self):
+        if self._ctrl:
+            self._ctrl.cancel()
+
+    def start_transfer(self, direction: str, filename: str,
+                       ctrl: "TransferControl | None" = None):
         self._hide_timer.stop()
+        self._ctrl = ctrl
         self.dir_lbl.setText("↑" if direction == "send" else "↓")
         fname = Path(filename).name if filename else filename
-        if len(fname) > 44:
-            fname = fname[:41] + "…"
+        if len(fname) > 36:
+            fname = fname[:33] + "…"
         self.name_lbl.setText(("正在发送: " if direction == "send" else "正在接收: ") + fname)
+        self.name_lbl.setStyleSheet("")
         self.bar.setValue(0)
         self.pct_lbl.setText("0%")
         self.speed_lbl.setText("")
+        show_ctrl = (direction == "send" and ctrl is not None)
+        self._btn_pause.setVisible(show_ctrl)
+        self._btn_cancel.setVisible(show_ctrl)
+        if show_ctrl:
+            self._btn_pause.setText("⏸")
         self.show()
 
     def update_progress(self, done: int, total: int, speed: float):
@@ -2213,8 +2301,12 @@ class TransferProgressWidget(QFrame):
         self.speed_lbl.setText(_human_speed(speed))
 
     def finish(self):
+        self._ctrl = None
         self.bar.setValue(100)
         self.pct_lbl.setText("100%")
+        self._btn_pause.setVisible(False)
+        self._btn_cancel.setVisible(False)
+        self.name_lbl.setStyleSheet("")
         self._hide_timer.start(1800)
 
 
@@ -2649,6 +2741,7 @@ class MainWindow(QMainWindow):
         self.staged_receives = {}              # ip -> [{parts, ts, name}] 待确认接收
         self._peer_list_state = {}             # 用于跳过无变化的重绘
         self._recv_placeholders = {}           # recv_id -> (sender_ip, QWidget)
+        self._send_ctrl: TransferControl | None = None   # 当前发送控制器
 
         self.signals = Signals()
         self.signals.peers_changed.connect(self._on_peers_change)
@@ -2800,7 +2893,18 @@ class MainWindow(QMainWindow):
         sc.setContentsMargins(14, 12, 14, 12)
         sc.setSpacing(2)
         sc.addWidget(self._lbl("本机", "selfLabel"))
-        sc.addWidget(self._lbl(self.hostname, "selfName"))
+        name_row = QHBoxLayout()
+        name_row.setSpacing(4)
+        self.self_name_lbl = self._lbl(self.hostname, "selfName")
+        name_row.addWidget(self.self_name_lbl, 1)
+        btn_rename = QPushButton("✎")
+        btn_rename.setObjectName("tool")
+        btn_rename.setFixedSize(22, 22)
+        btn_rename.setToolTip("修改本机显示名称")
+        btn_rename.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_rename.clicked.connect(self.action_rename_device)
+        name_row.addWidget(btn_rename)
+        sc.addLayout(name_row)
         sc.addWidget(self._lbl(self.local_ip, "selfIp"))
         sb.addWidget(selfCard)
 
@@ -3020,6 +3124,23 @@ class MainWindow(QMainWindow):
         return l
 
     # ---------- 设备栏操作 ----------
+    def action_rename_device(self):
+        """弹出输入框让用户修改本机显示名称，立即广播给局域网内的对端。"""
+        from PyQt6.QtWidgets import QInputDialog as _QID
+        cur = self.hostname
+        new_name, ok = _QID.getText(
+            self, "修改设备名称", "设置本机在局域网中显示的名称：",
+            text=cur)
+        if not ok or not new_name.strip():
+            return
+        new_name = new_name.strip()
+        set_setting("device_name", new_name)
+        self.hostname = new_name
+        self.self_name_lbl.setText(new_name)
+        if hasattr(self, "discovery"):
+            self.discovery.update_name(new_name)
+        self._append_log(f"设备名已改为: {new_name}", "info")
+
     def action_refresh_devices(self):
         """手动触发一次广播，快速重新发现局域网设备。"""
         self.btn_refresh.setEnabled(False)
@@ -3486,13 +3607,16 @@ class MainWindow(QMainWindow):
         port = self._peer_port(ip)
         first_name = next((it.get("path", "") or it.get("name", "")
                            for it in send_items if it["type"] != "text"), "")
+        has_binary = any(it["type"] in ("file", "image") for it in send_items)
+        ctrl = TransferControl() if has_binary else None
+        self._send_ctrl = ctrl
 
         def do():
             def on_prog(fn, done, total, speed):
                 self.signals.send_progress.emit(fn, done, total, speed)
             send_batch(send_items, ip, port, self.hostname,
                        lambda m, k="send": self.signals.log.emit(m, k),
-                       on_progress=on_prog, first_name=first_name)
+                       on_progress=on_prog, first_name=first_name, ctrl=ctrl)
             self.signals.send_done.emit()
         threading.Thread(target=do, daemon=True).start()
 
@@ -3553,7 +3677,7 @@ class MainWindow(QMainWindow):
         if not hit:
             fname = Path(filename).name if filename else "文件"
             if not self.xfer_progress.isVisible():
-                self.xfer_progress.start_transfer("send", fname)
+                self.xfer_progress.start_transfer("send", fname, self._send_ctrl)
             self.xfer_progress.update_progress(done, total, speed)
 
     def _on_recv_progress(self, recv_id, filename, done, total, speed):
@@ -3569,6 +3693,7 @@ class MainWindow(QMainWindow):
                 self.xfer_progress.finish()
 
     def _on_send_done(self):
+        self._send_ctrl = None
         FileCard.finish_all_transfers()
         ClickableImage.finish_all_transfers()
         self.xfer_progress.finish()
