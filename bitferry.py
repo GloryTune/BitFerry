@@ -695,6 +695,11 @@ class Discovery:
         self.running = True
         self.local_ip = get_local_ip()   # 主 LAN IP（已过滤 VPN）
         self._reply_times = {}           # ip -> 上次单播回应时间，用于限速
+        # 稳定的本机设备标识：同一台机器即使有多个 IP，对端也能归并成一台
+        self.uid = get_setting("device_uid", None)
+        if not self.uid:
+            self.uid = uuid.uuid4().hex[:12]
+            set_setting("device_uid", self.uid)
 
     # ---- 多网卡/VPN 感知 ----
     def _all_ips(self):
@@ -722,7 +727,7 @@ class Discovery:
             lan_ip = self._best_announce_ip()
         return json.dumps({
             "type": "announce", "name": self.hostname,
-            "ip": lan_ip, "port": TRANSFER_PORT,
+            "ip": lan_ip, "port": TRANSFER_PORT, "uid": self.uid,
         }).encode("utf-8")
 
     # ---- 生命周期 ----
@@ -849,6 +854,7 @@ class Discovery:
                     self.peers[ip] = {
                         "name": info.get("name", ip),
                         "port": info.get("port", TRANSFER_PORT),
+                        "uid": info.get("uid"),
                         "last": time.time(),
                     }
                 self.on_peers_change(self.snapshot())
@@ -880,6 +886,7 @@ class Discovery:
             for ip, p in self.peers.items():
                 out[ip] = {
                     "name": p["name"], "port": p["port"],
+                    "uid": p.get("uid"),
                     "online": (now - p["last"]) <= PEER_TIMEOUT,
                 }
             return out
@@ -3465,8 +3472,14 @@ class MainWindow(QMainWindow):
         self.online = peers
         changed = False
         for ip, p in peers.items():
-            if ip not in self.known or self.known[ip].get("name") != p["name"]:
-                self.known[ip] = {"name": p["name"]}
+            cur = self.known.get(ip)
+            if cur is None or cur.get("name") != p["name"] or cur.get("uid") != p.get("uid"):
+                entry = {"name": p["name"]}
+                # 保留已知 uid：对端旧版本本次广播没带 uid 时不要把旧的覆盖掉
+                uid = p.get("uid") or (cur or {}).get("uid")
+                if uid:
+                    entry["uid"] = uid
+                self.known[ip] = entry
                 changed = True
         if changed:
             self._save_devices()
@@ -3481,15 +3494,48 @@ class MainWindow(QMainWindow):
             if ip in self.offline_queue and self.offline_queue[ip]:
                 QTimer.singleShot(500, lambda i=ip: self._flush_offline_queue(i))
 
+    def _device_key(self, ip):
+        """同一台机器的多个 IP 归并到一个 key：优先用对端上报的 uid，
+        对端旧版本没有 uid 时退回按名称归并（同名多 IP 视为一台）。"""
+        uid = self.online.get(ip, {}).get("uid") or self.known.get(ip, {}).get("uid")
+        if uid:
+            return f"uid:{uid}"
+        name = self.online.get(ip, {}).get("name") or self.known.get(ip, {}).get("name")
+        return f"name:{name}" if name else f"ip:{ip}"
+
+    def _same_subnet(self, ip):
+        try:
+            local = getattr(self.discovery, "local_ip", "")
+            return ip.split(".")[:3] == local.split(".")[:3]
+        except Exception:
+            return False
+
     def _rebuild_peer_list(self):
         all_ips = set(self.known.keys()) | set(self.online.keys())
+
+        # 把同一台设备的多个 IP 归并为一组，每组只挑一个代表 IP 显示
+        groups = {}
+        for ip in all_ips:
+            groups.setdefault(self._device_key(ip), []).append(ip)
+
+        def pick_rep(ips):
+            # 当前正在聊天的 IP 若在本组，优先保留它，避免选中态/会话跳走
+            if self.current_ip in ips:
+                return self.current_ip
+            return sorted(ips, key=lambda ip: (
+                0 if self.online.get(ip, {}).get("online") else 1,  # 在线优先
+                0 if self._same_subnet(ip) else 1,                  # 同网段优先
+                ip,
+            ))[0]
+
+        rep_ips = [pick_rep(ips) for ips in groups.values()]
 
         def sort_key(ip):
             on = self.online.get(ip, {}).get("online", False)
             nm = self.online.get(ip, {}).get("name") or self.known.get(ip, {}).get("name", ip)
             return (0 if on else 1, nm.lower())
 
-        sorted_ips = sorted(all_ips, key=sort_key)
+        sorted_ips = sorted(rep_ips, key=sort_key)
 
         # 计算新状态, 若与缓存完全一致则跳过重绘(防止 Mac 闪烁)
         new_state = {
