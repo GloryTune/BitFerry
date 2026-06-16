@@ -867,14 +867,16 @@ class Discovery:
 class Receiver:
     """统一接收: 文件 / 文字 / 图片。"""
     def __init__(self, on_file, on_chat, on_log, on_progress=None,
-                 get_recv_confirm=None, on_recv_started=None, on_recv_done=None):
+                 get_recv_confirm=None, on_recv_started=None, on_recv_done=None,
+                 on_recv_cancelled=None):
         self.on_file = on_file             # (path, sender)
         self.on_chat = on_chat             # (sender_name, sender_ip, kind, payload)
         self.on_log = on_log
         self.on_progress = on_progress     # (recv_id, filename, done, total, speed)
         self.get_recv_confirm = get_recv_confirm or (lambda: False)
-        self.on_recv_started = on_recv_started  # (recv_id, sender, sender_ip, meta_json)
-        self.on_recv_done = on_recv_done        # (recv_id)
+        self.on_recv_started = on_recv_started    # (recv_id, sender, sender_ip, meta_json)
+        self.on_recv_done = on_recv_done          # (recv_id)
+        self.on_recv_cancelled = on_recv_cancelled  # (recv_id)
         self.running = True
 
     def start(self):
@@ -949,7 +951,9 @@ class Receiver:
                     speed = len(data) / elapsed if elapsed > 0.01 else 0
                     self.on_progress(single_recv_id, filename_hint, len(data), size, speed)
             if len(data) != size:
-                self.on_log(f"{filename_hint} 接收不完整", "error")
+                self.on_log(f"{filename_hint} 传输被取消", "info")
+                if self.on_recv_cancelled and size > 0:
+                    self.on_recv_cancelled(single_recv_id)
                 return
 
             if self.on_recv_done and size > 0:
@@ -1021,51 +1025,67 @@ class Receiver:
             self.on_recv_started(recv_id, sender, sender_ip,
                                  json.dumps(meta, ensure_ascii=False))
 
-        for part in parts:
-            ptype = part.get("type")
-            if ptype == "text":
-                out_parts.append({"type": "text", "text": part.get("text", "")})
-            elif ptype == "image":
-                size = part.get("size", 0)
-                data = self._recv_n_progress(conn, size, recv_id, first_fname,
-                                             recv_bytes, total_binary, t_start)
-                recv_bytes += size
-                fn = f"recv_{int(time.time()*1000*1000)%10**13}.png"
-                path = IMG_DIR / fn
-                with open(path, "wb") as f:
-                    f.write(data)
-                out_parts.append({"type": "image", "path": str(path)})
-            elif ptype == "file":
-                size = part.get("size", 0)
-                filename = os.path.basename(part.get("filename", "file.bin"))
-                data = self._recv_n_progress(conn, size, recv_id, filename,
-                                             recv_bytes, total_binary, t_start)
-                recv_bytes += size
-                if confirm:
-                    dest_dir = TEMP_RECV_DIR / folder
-                else:
-                    dest_dir = globals()["RECV_ROOT"] / folder
-                dest_dir.mkdir(parents=True, exist_ok=True)
-                rel = part.get("relpath")
-                if rel:
-                    dest = dest_dir / rel
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                else:
-                    dest = dest_dir / filename
-                    b, e = os.path.splitext(filename)
-                    i = 1
-                    while dest.exists():
-                        dest = dest_dir / f"{b}_{i}{e}"
-                        i += 1
-                with open(dest, "wb") as f:
-                    f.write(data)
-                final_dir = str(globals()["RECV_ROOT"] / folder) if confirm else ""
-                out_parts.append({"type": "file", "name": filename,
-                                  "size": size, "path": str(dest),
-                                  "staged": confirm,
-                                  "final_dir": final_dir})
-                if not confirm:
-                    self.on_file(str(dest), sender)
+        written_paths = []   # 记录已写盘的文件，用于取消时清理
+        try:
+            for part in parts:
+                ptype = part.get("type")
+                if ptype == "text":
+                    out_parts.append({"type": "text", "text": part.get("text", "")})
+                elif ptype == "image":
+                    size = part.get("size", 0)
+                    data = self._recv_n_progress(conn, size, recv_id, first_fname,
+                                                 recv_bytes, total_binary, t_start)
+                    recv_bytes += size
+                    fn = f"recv_{int(time.time()*1000*1000)%10**13}.png"
+                    path = IMG_DIR / fn
+                    with open(path, "wb") as f:
+                        f.write(data)
+                    written_paths.append(path)
+                    out_parts.append({"type": "image", "path": str(path)})
+                elif ptype == "file":
+                    size = part.get("size", 0)
+                    filename = os.path.basename(part.get("filename", "file.bin"))
+                    data = self._recv_n_progress(conn, size, recv_id, filename,
+                                                 recv_bytes, total_binary, t_start)
+                    recv_bytes += size
+                    if confirm:
+                        dest_dir = TEMP_RECV_DIR / folder
+                    else:
+                        dest_dir = globals()["RECV_ROOT"] / folder
+                    dest_dir.mkdir(parents=True, exist_ok=True)
+                    rel = part.get("relpath")
+                    if rel:
+                        dest = dest_dir / rel
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                    else:
+                        dest = dest_dir / filename
+                        b, e = os.path.splitext(filename)
+                        i = 1
+                        while dest.exists():
+                            dest = dest_dir / f"{b}_{i}{e}"
+                            i += 1
+                    with open(dest, "wb") as f:
+                        f.write(data)
+                    written_paths.append(dest)
+                    final_dir = str(globals()["RECV_ROOT"] / folder) if confirm else ""
+                    out_parts.append({"type": "file", "name": filename,
+                                      "size": size, "path": str(dest),
+                                      "staged": confirm,
+                                      "final_dir": final_dir})
+                    if not confirm:
+                        self.on_file(str(dest), sender)
+
+        except _TransferAborted:
+            # 发送方取消：删除已写盘的残缺文件，通知 UI 撤销占位符
+            for p in written_paths:
+                try:
+                    Path(p).unlink(missing_ok=True)
+                except Exception:
+                    pass
+            self.on_log(f"来自 {sender} 的传输被取消", "info")
+            if self.on_recv_cancelled and total_binary > 0:
+                self.on_recv_cancelled(recv_id)
+            return
 
         self.on_log(f"收到一批消息 · 来自 {sender} · {len(parts)} 项", "recv")
         if self.on_recv_done and total_binary > 0:
@@ -1074,12 +1094,12 @@ class Receiver:
         self.on_chat(sender, sender_ip, kind, json.dumps(out_parts, ensure_ascii=False))
 
     def _recv_n_progress(self, conn, n, recv_id, fname, base_done, total, t_start):
-        """接收 n 字节, 同时上报进度。"""
+        """接收 n 字节, 同时上报进度。连接提前关闭则抛出 _TransferAborted。"""
         data = bytearray()
         while len(data) < n:
             chunk = conn.recv(min(CHUNK, n - len(data)))
             if not chunk:
-                break
+                raise _TransferAborted(f"连接提前关闭，已收 {len(data)}/{n} 字节")
             data.extend(chunk)
             if self.on_progress and total > 0:
                 done = base_done + len(data)
@@ -1179,6 +1199,9 @@ def send_batch(items, peer_ip, peer_port, sender_name, on_log,
             return False
 
         header = {"kind": "batch", "sender": sender_name, "parts": parts}
+        # 再次检查：连接之前若已取消则直接退出，避免 header 已发出而对方开始等待数据
+        if ctrl and ctrl.is_cancelled:
+            return False
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(15.0)
         s.connect((peer_ip, peer_port))
@@ -1216,6 +1239,10 @@ def send_batch(items, peer_ip, peer_port, sender_name, on_log,
     except Exception as e:
         on_log(f"批量发送失败: {e}", "error")
         return False
+
+
+class _TransferAborted(Exception):
+    """发送方中途取消连接，接收方收到不完整数据时抛出。"""
 
 
 # ----------------------------- 传输控制器 -----------------------------
@@ -1266,6 +1293,7 @@ class Signals(QObject):
     recv_progress = pyqtSignal(str, str, int, int, float)   # recv_id, filename, done, total, speed_bps
     send_done = pyqtSignal()
     recv_done = pyqtSignal(str)                             # recv_id
+    recv_cancelled = pyqtSignal(str)                        # recv_id — 发送方取消传输
     msgs_delivered = pyqtSignal(str, int)                   # ip, count — 离线消息送达通知
 
 
@@ -2875,6 +2903,7 @@ class MainWindow(QMainWindow):
         self.signals.send_done.connect(self._on_send_done)
         self.signals.recv_done.connect(self._on_recv_done)
         self.signals.recv_started.connect(self._on_recv_started)
+        self.signals.recv_cancelled.connect(self._on_recv_cancelled)
         self.signals.msgs_delivered.connect(self._on_msgs_delivered)
 
         self.setWindowTitle("BitFerry 内网互传")
@@ -2898,7 +2927,8 @@ class MainWindow(QMainWindow):
             on_progress=lambda rid, fn, d, t, sp: self.signals.recv_progress.emit(rid, fn, d, t, sp),
             get_recv_confirm=lambda: get_setting("recv_confirm", False),
             on_recv_started=lambda rid, sn, sip, meta: self.signals.recv_started.emit(rid, sn, sip, meta),
-            on_recv_done=lambda rid: self.signals.recv_done.emit(rid))
+            on_recv_done=lambda rid: self.signals.recv_done.emit(rid),
+            on_recv_cancelled=lambda rid: self.signals.recv_cancelled.emit(rid))
         self.receiver.start()
 
         self._rebuild_peer_list()
@@ -3827,6 +3857,15 @@ class MainWindow(QMainWindow):
             if frame is not None:
                 frame.deleteLater()
         self.xfer_progress.finish()
+
+    def _on_recv_cancelled(self, recv_id):
+        """发送方取消传输：移除接收占位符，不插入任何气泡。"""
+        RecvCard.remove(recv_id)
+        entry = self._recv_placeholders.pop(recv_id, None)
+        if entry:
+            _, frame = entry
+            if frame is not None:
+                frame.deleteLater()
 
     def _on_recv_started(self, recv_id, sender_name, sender_ip, meta_json):
         """后台开始接收 → 在聊天里插入占位气泡，显示环形进度动画。"""
