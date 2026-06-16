@@ -509,7 +509,8 @@ def _try_open_win_firewall():
                  f"name={name}", "dir=in", "action=allow",
                  f"protocol={proto}", f"localport={port}",
                  f"program={exe}", "enable=yes"],
-                capture_output=True, timeout=5)
+                capture_output=True, timeout=5,
+                creationflags=subprocess.CREATE_NO_WINDOW)
     except Exception:
         pass
 
@@ -619,7 +620,7 @@ def _windows_region_screenshot(tmp, get_clipboard_image):
         ["snippingtool.exe", "/clip"],
     ):
         try:
-            subprocess.Popen(cmd)
+            subprocess.Popen(cmd, creationflags=subprocess.CREATE_NO_WINDOW)
             launched = True
             break
         except Exception:
