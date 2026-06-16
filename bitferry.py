@@ -1545,6 +1545,7 @@ class FileCard(QFrame):
         self._progress = 0.0        # 0.0 – 1.0
         self._speed = 0.0           # bytes/sec
         self._transferring = (name in FileCard._pending_transfer_names)
+        self._icon_pix = FileCard._load_icon(path, name)
 
         self.setObjectName("fileCardMine" if mine else "fileCard")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1552,7 +1553,7 @@ class FileCard(QFrame):
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._menu)
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(52, 8, 14, 8)   # 左边留出圆环空间
+        lay.setContentsMargins(52, 8, 14, 8)   # 左边留出图标/圆环空间
         lay.setSpacing(10)
         col = QVBoxLayout()
         col.setSpacing(2)
@@ -1567,6 +1568,25 @@ class FileCard(QFrame):
 
         FileCard._registry.append(self)
         self.destroyed.connect(self._unregister)
+
+    @staticmethod
+    def _load_icon(path: str, name: str) -> "QPixmap":
+        """获取操作系统原生文件类型图标。"""
+        try:
+            from PyQt6.QtWidgets import QFileIconProvider
+            from PyQt6.QtCore import QFileInfo
+            provider = QFileIconProvider()
+            # 文件/文件夹存在时直接获取系统图标（最准确）
+            if path and os.path.exists(path):
+                return provider.icon(QFileInfo(path)).pixmap(32, 32)
+            # 不存在时用文件名后缀推断（接收方在传输完成前也能显示正确图标）
+            dummy = QFileInfo(name or "file.bin")
+            pix = provider.icon(dummy).pixmap(32, 32)
+            if not pix.isNull():
+                return pix
+            return provider.icon(QFileIconProvider.IconType.File).pixmap(32, 32)
+        except Exception:
+            return QPixmap()
 
     def _unregister(self):
         try:
@@ -1647,7 +1667,15 @@ class FileCard(QFrame):
     # ---- 绘制苹果风格进度叠层 ----
     def paintEvent(self, event):
         super().paintEvent(event)
+        cx, cy = 26, self.height() // 2
+
         if not self._transferring:
+            if self._icon_pix and not self._icon_pix.isNull():
+                p = QPainter(self)
+                p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+                size = 28
+                p.drawPixmap(cx - size // 2, cy - size // 2, size, size, self._icon_pix)
+                p.end()
             return
 
         p = QPainter(self)
@@ -1657,7 +1685,6 @@ class FileCard(QFrame):
         p.fillRect(self.rect(), QColor(14, 17, 24, 170))
 
         # 2. 圆环位置 (左侧, 代替 📄 图标)
-        cx, cy = 26, self.height() // 2
         R_out = 17   # 外径
         R_in  = 10   # 内径 (环宽 = R_out - R_in)
 
