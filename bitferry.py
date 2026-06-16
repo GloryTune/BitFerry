@@ -3610,6 +3610,10 @@ class MainWindow(QMainWindow):
         has_binary = any(it["type"] in ("file", "image") for it in send_items)
         ctrl = TransferControl() if has_binary else None
         self._send_ctrl = ctrl
+        if ctrl and first_name:
+            # 立即展开进度横幅，让暂停/取消按钮立即可见
+            fname = Path(first_name).name if first_name else first_name
+            self.xfer_progress.start_transfer("send", fname, ctrl)
 
         def do():
             def on_prog(fn, done, total, speed):
@@ -3671,13 +3675,10 @@ class MainWindow(QMainWindow):
     # ---------- 传输进度回调(主线程) ----------
     def _on_send_progress(self, filename, done, total, speed):
         pct = done / total if total > 0 else 0
-        hit = FileCard.update_transfer(filename, pct, speed)
-        if not hit:
-            hit = ClickableImage.update_transfer(filename, pct, speed)
-        if not hit:
-            fname = Path(filename).name if filename else "文件"
-            if not self.xfer_progress.isVisible():
-                self.xfer_progress.start_transfer("send", fname, self._send_ctrl)
+        FileCard.update_transfer(filename, pct, speed)
+        ClickableImage.update_transfer(filename, pct, speed)
+        # 横幅进度始终同步（暂停/取消按钮在横幅上）
+        if self.xfer_progress.isVisible():
             self.xfer_progress.update_progress(done, total, speed)
 
     def _on_recv_progress(self, recv_id, filename, done, total, speed):
