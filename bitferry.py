@@ -358,10 +358,11 @@ _STYLE_TPL = (
     "#emptyChat {{ color:{t4}; font-size:13px; }}\n"
     "#recvCard {{ background:{rc}; border:1px solid {rc_b}; border-radius:{file_r}; }}\n"
     "#fileCard, #fileCardMine {{ background:{fc}; border:1px solid {fc_b}; border-radius:{file_r}; }}\n"
-    "#fileCardMine {{ background:{fc_m}; border:1px solid {fc_m}; }}\n"
+    "#fileCardMine {{ background:{fc_m}; border:1px solid {b3}; }}\n"
     "#fileCardName {{ color:{t1}; font-size:12px; font-weight:600; }}\n"
     "#fileCardNameMine {{ color:#FFFFFF; font-size:12px; font-weight:600; }}\n"
-    "#fileCardSize {{ color:{t2}; font-size:10px; }}\n"
+    "#fileCardSize {{ color:{t3}; font-size:10px; }}\n"
+    "#fileCardSizeMine {{ color:rgba(255,255,255,160); font-size:10px; }}\n"
     "#shortcutBox {{ background:{s1}; border:1px solid {b2}; border-radius:{input_r};"
         " color:{t1}; font-size:14px; font-weight:600; }}\n"
     "#shortcutBox:focus {{ border:1px solid {accent}; }}\n"
@@ -1390,35 +1391,56 @@ class RecvCard(QFrame):
     """接收方占位卡 - 图片或文件传输中显示环形进度动画，完成后由真实气泡替换。"""
     _registry: dict = {}   # recv_id → RecvCard
 
-    def __init__(self, recv_id, item_type, size_bytes=0):
+    def __init__(self, recv_id, item_type, fname="", size_bytes=0):
         super().__init__()
         self._recv_id = recv_id
         self._item_type = item_type
+        self._fname = fname
+        self._size_bytes = size_bytes
         self._progress = 0.0
         self._speed = 0.0
         self._transferring = True
-        if recv_id not in RecvCard._registry:
-            RecvCard._registry[recv_id] = self
-        self.destroyed.connect(self._unregister)
+        RecvCard._registry[recv_id] = self
+        self.setObjectName("recvCard")
+
         if item_type == "image":
             self.setFixedSize(200, 150)
         else:
+            # 文件型：与 FileCard 相同布局，圆环在左，文件名/大小在右
             self.setFixedSize(280, 56)
-        self.setObjectName("recvCard")
+            lay = QHBoxLayout(self)
+            lay.setContentsMargins(52, 8, 14, 8)
+            lay.setSpacing(10)
+            col = QVBoxLayout()
+            col.setSpacing(2)
+            nm = QLabel(fname or "文件")
+            nm.setObjectName("fileCardName")
+            nm.setMaximumWidth(200)
+            sz_text = human_size(size_bytes) if size_bytes else "接收中…"
+            sz = QLabel(sz_text)
+            sz.setObjectName("fileCardSize")
+            col.addWidget(nm)
+            col.addWidget(sz)
+            lay.addLayout(col, 1)
 
-    def _unregister(self):
-        if RecvCard._registry.get(self._recv_id) is self:
-            del RecvCard._registry[self._recv_id]
+    @classmethod
+    def remove(cls, recv_id):
+        """主动从注册表移除（在 deleteLater 之前调用，防止后续信号访问已删除对象）。"""
+        cls._registry.pop(recv_id, None)
 
     @classmethod
     def update_progress(cls, recv_id, pct, speed) -> bool:
         card = cls._registry.get(recv_id)
-        if card and card._transferring:
+        if card is None or not card._transferring:
+            return False
+        try:
             card._progress = pct
             card._speed = speed
             card.update()
             return True
-        return False
+        except RuntimeError:
+            cls._registry.pop(recv_id, None)
+            return False
 
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -1426,10 +1448,16 @@ class RecvCard(QFrame):
             return
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.fillRect(self.rect(), QColor(20, 24, 34, 220))
-        cx, cy = self.width() // 2, self.height() // 2
-        R_out, R_in = 22, 13
-        p.setPen(QPen(QColor(255, 255, 255, 45), 1.5))
+        # 图片型：整卡暗蒙层 + 居中圆环
+        if self._item_type == "image":
+            p.fillRect(self.rect(), QColor(20, 24, 34, 220))
+            cx, cy = self.width() // 2, self.height() // 2
+        else:
+            # 文件型：只在左侧圆环区域叠半透明蒙层，保留右侧文字可读
+            p.fillRect(0, 0, 48, self.height(), QColor(20, 24, 34, 180))
+            cx, cy = 26, self.height() // 2
+        R_out, R_in = 17, 10
+        p.setPen(QPen(QColor(255, 255, 255, 45), 1.0))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawEllipse(cx - R_out, cy - R_out, R_out * 2, R_out * 2)
         if self._progress > 0:
@@ -1441,18 +1469,14 @@ class RecvCard(QFrame):
         p.setBrush(QColor(20, 24, 34, 210))
         p.drawEllipse(cx - R_in, cy - R_in, R_in * 2, R_in * 2)
         if self._progress > 0:
-            p.setPen(QColor(255, 255, 255, 230))
-            f = QFont()
-            f.setPixelSize(9)
-            f.setBold(True)
+            p.setPen(QColor(255, 255, 255, 220))
+            f = QFont(); f.setPixelSize(8); f.setBold(True)
             p.setFont(f)
-            r = QRectF(cx - R_in, cy - R_in, R_in * 2, R_in * 2)
-            p.drawText(r, Qt.AlignmentFlag.AlignCenter, f"{int(self._progress * 100)}%")
-        if self._speed > 0:
+            p.drawText(QRectF(cx - R_in, cy - R_in, R_in * 2, R_in * 2),
+                       Qt.AlignmentFlag.AlignCenter, f"{int(self._progress * 100)}%")
+        if self._speed > 0 and self._item_type == "image":
             p.setPen(QColor(160, 175, 200, 200))
-            f2 = QFont()
-            f2.setPixelSize(10)
-            p.setFont(f2)
+            f2 = QFont(); f2.setPixelSize(10); p.setFont(f2)
             p.drawText(self.rect().adjusted(0, cy + R_out + 4, 0, 0),
                        Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
                        _human_speed(self._speed))
@@ -1492,7 +1516,7 @@ class FileCard(QFrame):
         nm.setObjectName("fileCardNameMine" if mine else "fileCardName")
         nm.setMaximumWidth(240)
         sz = QLabel(human_size(size) if size else "")
-        sz.setObjectName("fileCardSize")
+        sz.setObjectName("fileCardSizeMine" if mine else "fileCardSize")
         col.addWidget(nm)
         col.addWidget(sz)
         lay.addLayout(col, 1)
@@ -1638,13 +1662,18 @@ class FileCard(QFrame):
     # ---- 类方法: 由 MainWindow 信号调用 ----
     @classmethod
     def update_transfer(cls, filename: str, progress: float, speed: float) -> bool:
-        """更新所有文件名匹配的卡片。返回 True 表示有卡片被更新。"""
+        """更新当前正在传输且文件名匹配的卡片（跳过已完成的旧卡片）。"""
         fname = Path(filename).name if filename else filename
         hit = False
         for card in list(cls._registry):
+            if not card._transferring:
+                continue
             if card._fname == fname or card._fname == filename:
-                card.set_progress(progress, speed)
-                hit = True
+                try:
+                    card.set_progress(progress, speed)
+                    hit = True
+                except RuntimeError:
+                    cls._registry.remove(card)
         return hit
 
     @classmethod
@@ -1652,7 +1681,10 @@ class FileCard(QFrame):
         """结束所有正在传输的卡片动画（发送完成后调用）。"""
         for card in list(cls._registry):
             if card._transferring:
-                card.set_done()
+                try:
+                    card.set_done()
+                except RuntimeError:
+                    cls._registry.remove(card)
 
 
 class Bubble(QFrame):
@@ -1807,6 +1839,9 @@ class HistoryDialog(QDialog):
         cv.addStretch()
         scroll.setWidget(canvas)
         lay.addWidget(scroll, 1)
+        # 打开后定位到最新消息（底部）
+        QTimer.singleShot(50, lambda: scroll.verticalScrollBar().setValue(
+            scroll.verticalScrollBar().maximum()))
 
 
 class ShortcutCapture(QLabel):
@@ -3403,8 +3438,10 @@ class MainWindow(QMainWindow):
         offline = not self._peer_online(ip)
         msg_id = str(uuid.uuid4())
 
-        # 在线发送时，把文件名/路径注册到 FileCard/ClickableImage 待传集合
+        # 在线发送时，先结束旧的进度动画，再注册新文件到待传集合
         if not offline:
+            FileCard.finish_all_transfers()
+            ClickableImage.finish_all_transfers()
             FileCard._pending_transfer_names = {
                 Path(it["path"]).name
                 for it in send_items if it.get("type") == "file" and it.get("path")
@@ -3537,11 +3574,13 @@ class MainWindow(QMainWindow):
         self.xfer_progress.finish()
 
     def _on_recv_done(self, recv_id):
-        # 移除对应占位气泡（若有）
+        # 先从注册表移除，阻断后续进度信号访问已删除对象
+        RecvCard.remove(recv_id)
         entry = self._recv_placeholders.pop(recv_id, None)
         if entry:
             _, frame = entry
-            frame.deleteLater()
+            if frame is not None:
+                frame.deleteLater()
         self.xfer_progress.finish()
 
     def _on_recv_started(self, recv_id, sender_name, sender_ip, meta_json):
@@ -3564,7 +3603,8 @@ class MainWindow(QMainWindow):
         inner = QVBoxLayout()
         inner.setSpacing(4)
         for item in meta:
-            card = RecvCard(recv_id, item.get("type", "file"), item.get("size", 0))
+            card = RecvCard(recv_id, item.get("type", "file"),
+                            item.get("name", ""), item.get("size", 0))
             inner.addWidget(card)
         outer.addLayout(inner)
         outer.addStretch()
