@@ -6,17 +6,14 @@
 
 ---
 
-## 下载安装（推荐）
+## 📥 直接下载（无需 Python）
 
-**Windows 用户无需安装 Python，下载即用：**
+| 平台 | 下载 |
+|------|------|
+| **Windows 10/11 x64** | [BitFerry-windows-x64.exe](https://github.com/GloryTune/BitFerry/releases/latest/download/BitFerry-windows-x64.exe) |
+| **macOS (Apple Silicon)** | [BitFerry-macos-arm64.zip](https://github.com/GloryTune/BitFerry/releases/latest/download/BitFerry-macos-arm64.zip) |
 
-➡️ 前往 [**Releases 页面**](https://github.com/GloryTune/BitFerry/releases/latest) 下载最新的 `BitFerry-windows-x64.exe`，双击运行即可。
-
-- 首次运行若出现 Windows SmartScreen 提示，点「更多信息 → 仍要运行」。
-- 适用于 Windows 10/11 64 位。
-- 请确保防火墙放行 **UDP 50808**（设备发现）与 **TCP 50809**（文件/消息传输）。
-
-> macOS 用户暂无预编译包，请按下文「[快速运行（源码方式）](#快速运行源码方式)」或「[打包为独立应用](#打包为独立应用无需-python-环境)」自行运行/打包。
+> **macOS 提示**：解压后将 `BitFerry.app` 拖入应用程序文件夹。首次打开若提示"无法验证开发者"，前往 **系统设置 → 隐私与安全性** 点击「仍要打开」。
 
 ---
 
@@ -101,7 +98,7 @@ dist/BitFerry.app
 
 将 `BitFerry.app` 拖入 `/Applications` 即可像普通 Mac 应用一样使用，双击启动，无需安装 Python。
 
-> **体积说明：** 打包后约 65–70 MB，包含完整 Qt 框架，这是 PyQt6 应用的正常体积。
+> **体积说明：** 打包后约 130 MB（压缩包），包含完整 Qt 框架，这是 PyQt6 应用的正常体积。
 
 ---
 
