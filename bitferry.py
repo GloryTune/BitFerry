@@ -1041,13 +1041,60 @@ def _resize_rect(r: QRect, handle: str, pt: QPoint) -> QRect:
     return QRect(QPoint(l, t), QPoint(rr, b)).normalized()
 
 
+def _enum_window_rects_macos(vrect: QRect):
+    """macOS 上枚举可见的普通应用窗口(按 Z 序, 最上层在前), 转成 overlay 本地逻辑坐标。
+
+    用 CGWindowListCopyWindowInfo: 返回的 bounds 已是逻辑点(左上原点), 与 Qt 逻辑
+    坐标一致, 直接减去 vrect 原点即可, 无需 dpr 换算。只取 layer==0 的普通窗口,
+    自动排除菜单栏 / Dock / 控制中心等系统层, 以及我们自己的进程。失败返回空表。
+    """
+    rects = []
+    try:
+        import os
+        import Quartz
+        our_pid = os.getpid()
+        opts = (Quartz.kCGWindowListOptionOnScreenOnly |
+                Quartz.kCGWindowListExcludeDesktopElements)
+        wins = Quartz.CGWindowListCopyWindowInfo(opts, Quartz.kCGNullWindowID)
+        if not wins:
+            return []
+        for w in wins:                      # 已按前→后 Z 序
+            try:
+                if int(w.get(Quartz.kCGWindowLayer, 0)) != 0:
+                    continue                 # 只要普通应用窗口层, 排除菜单栏/Dock 等
+                if int(w.get(Quartz.kCGWindowOwnerPID, 0)) == our_pid:
+                    continue                 # 排除自己
+                alpha = w.get(Quartz.kCGWindowAlpha, 1.0)
+                if alpha is not None and float(alpha) <= 0.0:
+                    continue                 # 全透明窗口(占位/覆盖层)忽略
+                b = w.get(Quartz.kCGWindowBounds)
+                if not b:
+                    continue
+                x = float(b.get("X", 0.0))
+                y = float(b.get("Y", 0.0))
+                ww = float(b.get("Width", 0.0))
+                hh = float(b.get("Height", 0.0))
+                if ww < 12 or hh < 12:
+                    continue
+                rects.append(QRect(int(round(x - vrect.x())), int(round(y - vrect.y())),
+                                   int(round(ww)), int(round(hh))))
+            except Exception:
+                continue
+    except Exception:
+        return []
+    return rects
+
+
 def _enum_window_rects(vrect: QRect, dpr: float):
     """枚举当前可见的顶层窗口(按 Z 序, 最上层在前), 转成 overlay 本地逻辑坐标。
 
-    用于"截图时高亮鼠标所在窗口"。只在 Windows 实现, 失败返回空表。
+    用于"截图时高亮鼠标所在窗口"。Windows / macOS 均已实现, 其他平台返回空表。
     """
+    sysname = platform.system()
+    if sysname == "Darwin":
+        return _enum_window_rects_macos(vrect)
     rects = []
-    if platform.system() != "Windows":
+    if sysname != "Windows":
         return rects
     try:
         import os
@@ -6335,7 +6382,7 @@ class MainWindow(QMainWindow):
         else:
             self._start_system_screenshot()
 
-    # ---- 应用内截图(Windows) ----
+    # ---- 应用内截图(Windows / macOS) ----
     def _start_inapp_screenshot(self):
         if getattr(self, "_shot_overlay", None) is not None:
             return                       # 已有截图遮罩, 避免重复触发
