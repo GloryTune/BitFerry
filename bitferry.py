@@ -35,7 +35,7 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import (
     QFont, QPixmap, QImage, QKeySequence, QShortcut, QTextCursor, QGuiApplication,
     QIcon, QAction, QPainter, QColor, QPen, QPainterPath, QFontMetrics, QPolygonF,
-    QCursor,
+    QCursor, QTransform,
 )
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QMainWindow, QLabel, QPushButton, QListWidget,
@@ -664,6 +664,54 @@ def _human_speed(bps: float) -> str:
 
 def now_hm():
     return datetime.now().strftime("%H:%M")
+
+
+# ----------------------------- macOS 屏幕录制权限 -----------------------------
+def _macos_has_screen_permission() -> bool:
+    """检查 macOS 是否已授权屏幕录制权限（macOS 10.15+）。"""
+    try:
+        import ctypes
+        cg = ctypes.CDLL(
+            "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+        cg.CGPreflightScreenCaptureAccess.restype = ctypes.c_bool
+        return bool(cg.CGPreflightScreenCaptureAccess())
+    except Exception:
+        return True  # 无法检查时假设已有权限
+
+
+def _macos_request_screen_permission():
+    """向 macOS 请求屏幕录制权限（触发 TCC 弹窗，每个 bundle 只需一次）。"""
+    try:
+        import ctypes
+        cg = ctypes.CDLL(
+            "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+        cg.CGRequestScreenCaptureAccess()
+    except Exception:
+        pass
+
+
+def _macos_raise_overlay(widget):
+    """macOS: 把截图遮罩提到菜单栏/Dock 之上并激活。
+
+    无边框 Tool 窗口在 macOS 是 NSPanel(可成为 key window, 故 Esc/文字输入可用),
+    但默认层级低于菜单栏。这里把它提到屏保层级并加入所有 Space, 实现全屏覆盖。
+    """
+    try:
+        import objc
+        from AppKit import (NSApplication, NSScreenSaverWindowLevel,
+                            NSWindowCollectionBehaviorCanJoinAllSpaces,
+                            NSWindowCollectionBehaviorFullScreenAuxiliary)
+        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+        view = objc.objc_object(c_void_p=int(widget.winId()))
+        win = view.window()
+        if win is not None:
+            win.setLevel_(NSScreenSaverWindowLevel)
+            win.setCollectionBehavior_(
+                int(NSWindowCollectionBehaviorCanJoinAllSpaces)
+                | int(NSWindowCollectionBehaviorFullScreenAuxiliary))
+            win.makeKeyAndOrderFront_(None)
+    except Exception:
+        pass
 
 
 # ----------------------------- 主动截图(系统级) -----------------------------
@@ -1756,6 +1804,639 @@ class ScreenshotOverlay(QWidget):
         self.close()
         # 等 overlay 彻底关闭后再回调, 确保焦点能干净地回到主窗口。
         QTimer.singleShot(0, lambda: cb(path))
+
+
+class _EditorCanvas(QWidget):
+    """图片编辑画布: 在一张已有图片上做标注(矩形/椭圆/箭头/画笔/文字)、裁剪、旋转。
+
+    标注坐标统一存放在"图片像素坐标"中; 画布按 self._scale 缩放显示, 鼠标坐标在
+    进入逻辑前转换为图片坐标。裁剪/旋转会把当前标注烘焙进底图后清空, 几何变换只作
+    用于底图。被 ImageEditorDialog 承载。
+    """
+
+    def __init__(self, pixmap):
+        super().__init__()
+        self._pixmap = pixmap                 # 全分辨率工作底图
+        self._scale = 1.0
+        self.on_changed = None                # 画布尺寸变化回调(供 dialog 调整)
+        # 标注
+        self._annotations = []
+        self._cur_ann = None
+        self._drawing = False
+        self._selected = None
+        self._moving = False
+        self._move_last = None
+        self._ann_resizing = None
+        self._tool = None
+        self._color = QColor(ScreenshotOverlay.COLORS[0])
+        self._width = 4
+        self._text_edit = None
+        # 裁剪
+        self._crop_mode = False
+        self._crop_rect = QRect()
+        self._crop_resizing = None
+        self._crop_orig = QRect()
+        self._crop_moving = False
+        self._crop_drawing = False
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self._recompute_scale()
+
+    # ---------- 坐标/缩放 ----------
+    def _recompute_scale(self):
+        screen = QApplication.primaryScreen()
+        avail = screen.availableGeometry() if screen else QRect(0, 0, 1200, 800)
+        max_w = max(320, int(avail.width() * 0.78))
+        max_h = max(240, int(avail.height() * 0.68))
+        iw, ih = self._pixmap.width(), self._pixmap.height()
+        s = 1.0
+        if iw and ih:
+            s = min(1.0, max_w / iw, max_h / ih)
+        self._scale = s if s > 0 else 1.0
+        self.setFixedSize(max(1, int(iw * self._scale)), max(1, int(ih * self._scale)))
+        if callable(self.on_changed):
+            self.on_changed()
+        self.update()
+
+    def _to_img(self, pos):
+        return QPoint(int(round(pos.x() / self._scale)), int(round(pos.y() / self._scale)))
+
+    def _to_widget(self, pt):
+        return QPoint(int(round(pt.x() * self._scale)), int(round(pt.y() * self._scale)))
+
+    def _img_rect(self):
+        return QRect(0, 0, self._pixmap.width(), self._pixmap.height())
+
+    def _clamp(self, pt):
+        r = self._img_rect()
+        return QPoint(min(max(pt.x(), 0), r.right()), min(max(pt.y(), 0), r.bottom()))
+
+    # ---------- 绘制 ----------
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.save()
+        p.scale(self._scale, self._scale)
+        p.drawPixmap(0, 0, self._pixmap)
+        for ann in self._annotations:
+            _draw_annotation(p, ann)
+        if self._cur_ann is not None:
+            _draw_annotation(p, self._cur_ann)
+        p.restore()
+        if self._crop_mode and self._crop_rect.width() > 0 and self._crop_rect.height() > 0:
+            wr = QRect(self._to_widget(self._crop_rect.topLeft()),
+                       self._to_widget(self._crop_rect.bottomRight()))
+            outside = QPainterPath()
+            outside.addRect(QRectF(self.rect()))
+            inner = QPainterPath()
+            inner.addRect(QRectF(wr))
+            p.fillPath(outside.subtracted(inner), QColor(0, 0, 0, 120))
+            p.setPen(QPen(QColor("#5B8CFF"), 2))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRect(wr)
+            for pt in _handle_points(wr).values():
+                self._draw_handle(p, pt)
+        elif self._selected is not None and 0 <= self._selected < len(self._annotations):
+            self._draw_ann_selection(p, self._annotations[self._selected])
+        p.end()
+
+    def _draw_handle(self, p, pt):
+        s = 4
+        p.setPen(QPen(QColor("#5B8CFF"), 1))
+        p.setBrush(QColor("#FFFFFF"))
+        p.drawRect(QRect(pt.x() - s, pt.y() - s, 2 * s, 2 * s))
+
+    def _draw_ann_selection(self, p, ann):
+        if ann.kind in ("rect", "ellipse"):
+            r = QRect(ann.p1, ann.p2).normalized()
+            wr = QRect(self._to_widget(r.topLeft()), self._to_widget(r.bottomRight()))
+            for pt in _handle_points(wr).values():
+                self._draw_handle(p, pt)
+        elif ann.kind == "arrow":
+            self._draw_handle(p, self._to_widget(ann.p1))
+            self._draw_handle(p, self._to_widget(ann.p2))
+        else:
+            br = _ann_bounds(ann).adjusted(-4, -4, 4, 4)
+            wr = QRect(self._to_widget(br.topLeft()), self._to_widget(br.bottomRight()))
+            p.setPen(QPen(QColor("#FFFFFF"), 1, Qt.PenStyle.DashLine))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRect(wr)
+
+    # ---------- 工具状态(供 dialog 调用) ----------
+    def set_tool(self, key):
+        self._tool = key
+        self._selected = None
+        self.setCursor(Qt.CursorShape.CrossCursor if key else Qt.CursorShape.ArrowCursor)
+        self.update()
+
+    def set_color(self, c):
+        self._color = QColor(c)
+        if self._selected is not None and 0 <= self._selected < len(self._annotations):
+            self._annotations[self._selected].color = QColor(c)
+            self.update()
+
+    def set_width(self, w):
+        self._width = w
+        if self._selected is not None and 0 <= self._selected < len(self._annotations):
+            self._annotations[self._selected].width = w
+            self.update()
+
+    def undo(self):
+        if self._annotations:
+            self._annotations.pop()
+            self._selected = None
+            self.update()
+
+    def delete_selected(self):
+        if self._selected is not None and 0 <= self._selected < len(self._annotations):
+            self._annotations.pop(self._selected)
+            self._selected = None
+            self.update()
+
+    # ---------- 裁剪/旋转 ----------
+    def toggle_crop(self):
+        if self._crop_mode:
+            self.apply_crop()
+        else:
+            self._crop_mode = True
+            self._set_tool_silent(None)
+            self._selected = None
+            r = self._img_rect()
+            m = max(0, min(r.width(), r.height()) // 12)
+            self._crop_rect = r.adjusted(m, m, -m, -m)
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            self.update()
+
+    def _set_tool_silent(self, key):
+        self._tool = key
+
+    def cancel_crop(self):
+        self._crop_mode = False
+        self._crop_rect = QRect()
+        self._crop_drawing = self._crop_moving = False
+        self._crop_resizing = None
+        self.update()
+
+    def apply_crop(self):
+        if not self._crop_mode:
+            return
+        r = self._crop_rect.normalized().intersected(self._img_rect())
+        self._crop_mode = False
+        self._crop_rect = QRect()
+        if r.width() < 5 or r.height() < 5:
+            self.update()
+            return
+        self._bake()
+        self._pixmap = self._pixmap.copy(r)
+        self._annotations.clear()
+        self._selected = None
+        self._recompute_scale()
+
+    def rotate(self, cw=True):
+        if self._crop_mode:
+            self.cancel_crop()
+        self._bake()
+        t = QTransform()
+        t.rotate(90 if cw else -90)
+        self._pixmap = self._pixmap.transformed(
+            t, Qt.TransformationMode.SmoothTransformation)
+        self._annotations.clear()
+        self._selected = None
+        self._recompute_scale()
+
+    def _bake(self):
+        if not self._annotations:
+            return
+        p = QPainter(self._pixmap)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        for ann in self._annotations:
+            _draw_annotation(p, ann)
+        p.end()
+
+    def result_pixmap(self):
+        if self._crop_mode:
+            self.apply_crop()
+        self._bake()
+        self._annotations.clear()
+        return self._pixmap
+
+    # ---------- 命中测试 ----------
+    def _hit_test(self, pos):
+        for i in range(len(self._annotations) - 1, -1, -1):
+            if _ann_hit(self._annotations[i], pos):
+                return i
+        return None
+
+    def _ann_handle_at(self, ann, pos):
+        tol = max(6, int(round(8 / self._scale)))
+        if ann.kind in ("rect", "ellipse"):
+            return _handle_at(QRect(ann.p1, ann.p2).normalized(), pos, tol)
+        if ann.kind == "arrow":
+            if (pos - ann.p1).manhattanLength() <= tol * 2:
+                return "a1"
+            if (pos - ann.p2).manhattanLength() <= tol * 2:
+                return "a2"
+        return None
+
+    # ---------- 鼠标 ----------
+    def mousePressEvent(self, e):
+        if e.button() != Qt.MouseButton.LeftButton:
+            return
+        pos_w = e.pos()
+        pos = self._to_img(pos_w)
+        tol = max(6, int(round(8 / self._scale)))
+        if self._crop_mode:
+            h = _handle_at(self._crop_rect.normalized(), pos, tol)
+            if h:
+                self._crop_resizing = h
+                self._crop_orig = QRect(self._crop_rect.normalized())
+                return
+            if self._crop_rect.normalized().contains(pos):
+                self._crop_moving = True
+                self._move_last = pos
+                return
+            self._crop_rect = QRect(pos, pos)
+            self._crop_drawing = True
+            self._move_last = pos
+            return
+        if self._text_edit is not None:
+            return
+        if self._selected is not None and 0 <= self._selected < len(self._annotations):
+            ah = self._ann_handle_at(self._annotations[self._selected], pos)
+            if ah:
+                self._ann_resizing = (self._selected, ah)
+                return
+        hit = self._hit_test(pos)
+        if hit is not None:
+            self._selected = hit
+            self._moving = True
+            self._move_last = pos
+            self.update()
+            return
+        self._selected = None
+        if not self._tool:
+            self.update()
+            return
+        if self._tool == "text":
+            self._begin_text(pos, pos_w)
+            return
+        ann = _Annotation(self._tool, QColor(self._color), self._width)
+        ann.p1 = self._clamp(pos)
+        ann.p2 = ann.p1
+        if self._tool == "pen":
+            ann.points = [ann.p1]
+        self._cur_ann = ann
+        self._drawing = True
+        self.update()
+
+    def mouseMoveEvent(self, e):
+        pos = self._to_img(e.pos())
+        if self._crop_mode:
+            if self._crop_resizing:
+                self._crop_rect = _resize_rect(
+                    self._crop_orig, self._crop_resizing, self._clamp(pos))
+                self.update()
+                return
+            if self._crop_drawing:
+                self._crop_rect = QRect(self._move_last, self._clamp(pos)).normalized()
+                self.update()
+                return
+            if self._crop_moving and self._move_last is not None:
+                dx, dy = pos.x() - self._move_last.x(), pos.y() - self._move_last.y()
+                self._move_last = pos
+                r = self._crop_rect.translated(dx, dy)
+                ir = self._img_rect()
+                if r.left() < 0:
+                    r.translate(-r.left(), 0)
+                if r.top() < 0:
+                    r.translate(0, -r.top())
+                if r.right() > ir.right():
+                    r.translate(ir.right() - r.right(), 0)
+                if r.bottom() > ir.bottom():
+                    r.translate(0, ir.bottom() - r.bottom())
+                self._crop_rect = r
+                self.update()
+                return
+            self._update_crop_cursor(pos)
+            return
+        if self._ann_resizing is not None:
+            idx, h = self._ann_resizing
+            ann = self._annotations[idx]
+            pt = self._clamp(pos)
+            if ann.kind == "arrow":
+                if h == "a1":
+                    ann.p1 = pt
+                else:
+                    ann.p2 = pt
+            else:
+                new = _resize_rect(QRect(ann.p1, ann.p2).normalized(), h, pt)
+                ann.p1, ann.p2 = new.topLeft(), new.bottomRight()
+            self.update()
+            return
+        if self._moving and self._selected is not None and self._move_last is not None:
+            dx, dy = pos.x() - self._move_last.x(), pos.y() - self._move_last.y()
+            self._move_last = pos
+            _ann_translate(self._annotations[self._selected], dx, dy)
+            self.update()
+            return
+        if self._drawing and self._cur_ann is not None:
+            pt = self._clamp(pos)
+            self._cur_ann.p2 = pt
+            if self._cur_ann.kind == "pen":
+                self._cur_ann.points.append(pt)
+            self.update()
+            return
+        self._update_hover_cursor(pos)
+
+    def _update_crop_cursor(self, pos):
+        tol = max(6, int(round(8 / self._scale)))
+        h = _handle_at(self._crop_rect.normalized(), pos, tol)
+        if h:
+            self.setCursor(_HANDLE_CURSORS[h])
+        elif self._crop_rect.normalized().contains(pos):
+            self.setCursor(Qt.CursorShape.SizeAllCursor)
+        else:
+            self.setCursor(Qt.CursorShape.CrossCursor)
+
+    def _update_hover_cursor(self, pos):
+        if self._selected is not None and 0 <= self._selected < len(self._annotations):
+            ah = self._ann_handle_at(self._annotations[self._selected], pos)
+            if ah in _HANDLE_CURSORS:
+                self.setCursor(_HANDLE_CURSORS[ah])
+                return
+            if ah:
+                self.setCursor(Qt.CursorShape.SizeAllCursor)
+                return
+        if self._hit_test(pos) is not None:
+            self.setCursor(Qt.CursorShape.SizeAllCursor)
+            return
+        if self._tool:
+            self.setCursor(Qt.CursorShape.CrossCursor)
+            return
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def mouseReleaseEvent(self, e):
+        if e.button() != Qt.MouseButton.LeftButton:
+            return
+        if self._crop_mode:
+            self._crop_resizing = None
+            self._crop_moving = False
+            self._crop_drawing = False
+            return
+        if self._ann_resizing is not None:
+            self._ann_resizing = None
+            return
+        if self._moving:
+            self._moving = False
+            return
+        if self._drawing and self._cur_ann is not None:
+            self._drawing = False
+            ann = self._cur_ann
+            self._cur_ann = None
+            if self._ann_is_valid(ann):
+                self._annotations.append(ann)
+            self.update()
+
+    def _ann_is_valid(self, ann):
+        if ann.kind == "pen":
+            return len(ann.points) >= 2
+        return (ann.p2 - ann.p1).manhattanLength() >= 3
+
+    # ---------- 文字标注 ----------
+    def _begin_text(self, pos, pos_w):
+        ed = _TextInput(self)
+        f = QFont()
+        f.setPointSizeF(max(8.0, 14.0))
+        ed.setFont(f)
+        ed.setStyleSheet(
+            f"background:transparent; border:1px dashed {self._color.name()};"
+            f" color:{self._color.name()}; padding:1px;")
+        ed.move(pos_w)
+        ed.resize(220, ed.sizeHint().height())
+        ed.committed.connect(lambda t, e=ed, pt=pos, c=QColor(self._color):
+                             self._commit_text(t, e, pt, c))
+        ed.cancelled.connect(lambda e=ed: self._cancel_text(e))
+        ed.show()
+        ed.setFocus()
+        self._text_edit = ed
+
+    def _commit_text(self, text, ed, pos, color):
+        if self._text_edit is None:
+            return
+        self._text_edit = None
+        if text.strip():
+            ann = _Annotation("text", color, self._width)
+            ann.p1 = pos
+            ann.text = text
+            f = QFont()
+            f.setPointSizeF(max(6.0, 14.0 / self._scale))   # 显示 14pt 烘焙到图片像素
+            ann.font = f
+            self._annotations.append(ann)
+        ed.deleteLater()
+        self.update()
+
+    def _cancel_text(self, ed):
+        self._text_edit = None
+        ed.deleteLater()
+        self.update()
+
+
+class ImageEditorDialog(QDialog):
+    """在应用内编辑一张已落地的图片(发送框里的截图缩略图双击打开)。
+
+    顶部工具条复用截图时的标注工具(矩形/椭圆/箭头/画笔/文字 + 颜色 + 线宽 + 撤销),
+    并额外提供裁剪与旋转。确认后把结果另存为新 PNG, result_path 给出新路径。
+    """
+
+    def __init__(self, parent, image_path):
+        super().__init__(parent)
+        self.setWindowTitle("编辑图片")
+        self.setStyleSheet(STYLE)
+        self.result_path = None
+        self._src_path = image_path
+        self.canvas = _EditorCanvas(QPixmap(image_path))
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        root.addWidget(self._build_toolbar())
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(False)
+        scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        scroll.setStyleSheet("QScrollArea { background:#15171C; border:none; }")
+        holder = QWidget()
+        holder.setStyleSheet("background:#15171C;")
+        hl = QVBoxLayout(holder)
+        hl.setContentsMargins(16, 16, 16, 16)
+        hl.addWidget(self.canvas, 0, Qt.AlignmentFlag.AlignCenter)
+        scroll.setWidget(holder)
+        root.addWidget(scroll, 1)
+
+        self.canvas.on_changed = lambda: holder.adjustSize()
+        screen = QApplication.primaryScreen()
+        avail = screen.availableGeometry() if screen else QRect(0, 0, 1100, 800)
+        self.resize(min(avail.width() - 80, self.canvas.width() + 120),
+                    min(avail.height() - 80, self.canvas.height() + 150))
+
+    def _build_toolbar(self):
+        bar = QFrame()
+        bar.setObjectName("shotToolbar")
+        bar.setStyleSheet(
+            "#shotToolbar { background:#23262E; border-bottom:1px solid #3A3F4B; }"
+            " QToolButton { background:transparent; color:#E6E8EC; border:none;"
+            " border-radius:6px; padding:5px 7px; font-size:15px; }"
+            " QToolButton:hover { background:#343945; }"
+            " QToolButton:checked { background:#5B8CFF; color:#FFFFFF; }")
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(8, 6, 8, 6)
+        lay.setSpacing(2)
+        self._tool_btns = {}
+
+        def add_tool(key, tip):
+            b = QToolButton(bar)
+            b.setIcon(_tool_icon(key))
+            b.setIconSize(QSize(18, 18))
+            b.setToolTip(tip)
+            b.setCheckable(True)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(lambda _=False, k=key: self._select_tool(k))
+            lay.addWidget(b)
+            self._tool_btns[key] = b
+
+        add_tool("rect", "矩形")
+        add_tool("ellipse", "椭圆")
+        add_tool("arrow", "箭头")
+        add_tool("pen", "画笔")
+        add_tool("text", "文字")
+
+        self._add_sep(lay)
+        self._color_btns = []
+        for c in ScreenshotOverlay.COLORS:
+            b = QToolButton(bar)
+            b.setCheckable(True)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setFixedSize(20, 20)
+            b.setStyleSheet(
+                f"QToolButton {{ background:{c}; border:1px solid #555; border-radius:10px; }}"
+                f" QToolButton:checked {{ border:2px solid #5B8CFF; }}")
+            b.clicked.connect(lambda _=False, col=c: self._select_color(col))
+            lay.addWidget(b)
+            self._color_btns.append((c, b))
+        self._color_btns[0][1].setChecked(True)
+
+        self._add_sep(lay)
+        self._width_btns = []
+        for label, w in ScreenshotOverlay.WIDTHS:
+            b = QToolButton(bar)
+            b.setText(label)
+            b.setCheckable(True)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(lambda _=False, ww=w: self._select_width(ww))
+            if w == 4:
+                b.setChecked(True)
+            lay.addWidget(b)
+            self._width_btns.append((w, b))
+
+        self._add_sep(lay)
+        self._btn_crop = QToolButton(bar)
+        self._btn_crop.setText("裁剪")
+        self._btn_crop.setCheckable(True)
+        self._btn_crop.setToolTip("裁剪（拖动选框，再次点击或回车应用，Esc 取消）")
+        self._btn_crop.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_crop.clicked.connect(self._toggle_crop)
+        lay.addWidget(self._btn_crop)
+        b_rl = QToolButton(bar); b_rl.setText("↺"); b_rl.setToolTip("向左旋转 90°")
+        b_rl.setCursor(Qt.CursorShape.PointingHandCursor)
+        b_rl.clicked.connect(lambda: self._rotate(False)); lay.addWidget(b_rl)
+        b_rr = QToolButton(bar); b_rr.setText("↻"); b_rr.setToolTip("向右旋转 90°")
+        b_rr.setCursor(Qt.CursorShape.PointingHandCursor)
+        b_rr.clicked.connect(lambda: self._rotate(True)); lay.addWidget(b_rr)
+        b_undo = QToolButton(bar); b_undo.setText("⟲撤销"); b_undo.setToolTip("撤销 (Ctrl+Z)")
+        b_undo.setCursor(Qt.CursorShape.PointingHandCursor)
+        b_undo.clicked.connect(self.canvas.undo); lay.addWidget(b_undo)
+
+        lay.addStretch()
+        b_cancel = QToolButton(bar); b_cancel.setText("✕ 取消")
+        b_cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        b_cancel.setStyleSheet("QToolButton { color:#FF6B6B; }")
+        b_cancel.clicked.connect(self.reject); lay.addWidget(b_cancel)
+        b_ok = QToolButton(bar); b_ok.setText("✓ 完成")
+        b_ok.setCursor(Qt.CursorShape.PointingHandCursor)
+        b_ok.setStyleSheet("QToolButton { color:#2ECC71; font-weight:bold; }")
+        b_ok.clicked.connect(self._confirm); lay.addWidget(b_ok)
+        return bar
+
+    def _add_sep(self, lay):
+        sep = QFrame()
+        sep.setFixedWidth(1)
+        sep.setStyleSheet("background:#3A3F4B;")
+        lay.addWidget(sep)
+
+    def _select_tool(self, key):
+        self.canvas.set_tool(key)
+        if self.canvas._crop_mode:
+            self._set_crop_checked(False)
+            self.canvas.cancel_crop()
+        for k, b in self._tool_btns.items():
+            b.setChecked(k == key)
+
+    def _select_color(self, c):
+        self.canvas.set_color(c)
+        for cc, b in self._color_btns:
+            b.setChecked(cc == c)
+
+    def _select_width(self, w):
+        self.canvas.set_width(w)
+        for ww, b in self._width_btns:
+            b.setChecked(ww == w)
+
+    def _toggle_crop(self):
+        self.canvas.toggle_crop()
+        self._set_crop_checked(self.canvas._crop_mode)
+        if self.canvas._crop_mode:
+            for b in self._tool_btns.values():
+                b.setChecked(False)
+
+    def _set_crop_checked(self, on):
+        self._btn_crop.setChecked(on)
+
+    def _rotate(self, cw):
+        self.canvas.rotate(cw)
+        self._set_crop_checked(False)
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key.Key_Escape:
+            if self.canvas._crop_mode:
+                self.canvas.cancel_crop()
+                self._set_crop_checked(False)
+            else:
+                self.reject()
+            return
+        if e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if self.canvas._crop_mode:
+                self.canvas.apply_crop()
+                self._set_crop_checked(False)
+            else:
+                self._confirm()
+            return
+        if e.key() in (Qt.Key.Key_Backspace, Qt.Key.Key_Delete):
+            self.canvas.delete_selected()
+            return
+        if e.key() == Qt.Key.Key_Z and (e.modifiers() & Qt.KeyboardModifier.ControlModifier):
+            self.canvas.undo()
+            return
+        super().keyPressEvent(e)
+
+    def _confirm(self):
+        try:
+            IMG_DIR.mkdir(parents=True, exist_ok=True)
+            out = IMG_DIR / f"stage_{int(time.time() * 1000)}_{os.getpid()}_edit.png"
+            self.canvas.result_pixmap().save(str(out), "PNG")
+            self.result_path = str(out)
+        except Exception:
+            self.result_path = None
+        self.accept()
 
 
 # ===================================================================
@@ -4045,6 +4726,65 @@ class ChatInput(QTextEdit):
         self._img_map.clear()
         self._img_counter = 0
 
+    # ---- 双击发送框里的缩略图: 打开应用内图片编辑器(标注/裁剪/旋转) ----
+    def mouseDoubleClickEvent(self, e):
+        name = self._image_name_at(e.pos())
+        if name and name in self._img_map:
+            path = self._img_map[name]
+            if path and os.path.exists(path):
+                dlg = ImageEditorDialog(self.window(), path)
+                if dlg.exec() and dlg.result_path:
+                    self._replace_image(name, dlg.result_path)
+                return
+        super().mouseDoubleClickEvent(e)
+
+    def _image_name_at(self, pos):
+        from PyQt6.QtGui import QTextCursor as _TC
+        cur = self.cursorForPosition(pos)
+        p = cur.position()
+        doc = self.document()
+        for off in (0, -1):
+            c = _TC(doc)
+            c.setPosition(max(0, p + off))
+            if not c.movePosition(_TC.MoveOperation.Right, _TC.MoveMode.KeepAnchor):
+                continue
+            fmt = c.charFormat()
+            if fmt.isImageFormat():
+                return fmt.toImageFormat().name()
+        return None
+
+    def _replace_image(self, name, newpath):
+        """编辑完成后, 用新图片替换发送框里对应的缩略图与发送路径。"""
+        from PyQt6.QtGui import QTextImageFormat, QImage as _QImage, QTextCursor as _TC
+        img = _QImage(newpath)
+        if img.isNull():
+            return
+        disp_w = min(160, img.width())
+        ratio = disp_w / img.width() if img.width() else 1
+        disp_h = int(img.height() * ratio)
+        thumb = img.scaledToWidth(disp_w, Qt.TransformationMode.SmoothTransformation)
+        self.document().addResource(3, QUrl(name), thumb)
+        self._img_map[name] = newpath
+        doc = self.document()
+        block = doc.begin()
+        while block.isValid():
+            it = block.begin()
+            while not it.atEnd():
+                frag = it.fragment()
+                if frag.isValid() and frag.charFormat().isImageFormat() \
+                        and frag.charFormat().toImageFormat().name() == name:
+                    cur = _TC(doc)
+                    cur.setPosition(frag.position())
+                    cur.setPosition(frag.position() + frag.length(), _TC.MoveMode.KeepAnchor)
+                    fmt = QTextImageFormat()
+                    fmt.setName(name)
+                    fmt.setWidth(disp_w)
+                    fmt.setHeight(disp_h)
+                    cur.setCharFormat(fmt)
+                    return
+                it += 1
+            block = block.next()
+
     # ---- 右键菜单: 剪贴板里有截图/文件时, 让“粘贴”可用 ----
     def contextMenuEvent(self, e):
         menu = self.createStandardContextMenu()
@@ -4219,6 +4959,12 @@ class MainWindow(QMainWindow):
         self.signals.recv_cancelled.connect(self._on_recv_cancelled)
         self.signals.msgs_delivered.connect(self._on_msgs_delivered)
 
+        # macOS: 点击 Dock 图标时 QApplication 会发 ApplicationActive 状态,
+        # 借此将被 hide() 隐藏的窗口还原到前台。
+        if platform.system() == "Darwin":
+            QApplication.instance().applicationStateChanged.connect(
+                self._on_macos_app_activated)
+
         self.setWindowTitle("BitFerry 内网快传")
         self.setMinimumSize(*MIN_WIN_SIZE)
         restored = False
@@ -4362,6 +5108,13 @@ class MainWindow(QMainWindow):
     def _restore_window(self):
         self._bring_to_front()
 
+    def _on_macos_app_activated(self, state):
+        """macOS: 用户点击 Dock 图标时 Qt 触发 ApplicationActive 状态，将隐藏的窗口恢复到前台。"""
+        from PyQt6.QtCore import Qt
+        if state == Qt.ApplicationState.ApplicationActive:
+            if not self.isVisible() or self.isMinimized():
+                self._bring_to_front()
+
     def _bring_to_front(self):
         """恢复窗口并尽量强制带到前台。
 
@@ -4372,6 +5125,23 @@ class MainWindow(QMainWindow):
         self.showNormal()
         self.raise_()
         self.activateWindow()
+        if platform.system() == "Darwin":
+            # activateWindow() 在 macOS 上对隐藏窗口常常无效,
+            # 需通过 AppKit 告知系统让本应用抢占前台焦点。
+            try:
+                from AppKit import NSApplication  # type: ignore
+                NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+            except Exception:
+                try:
+                    subprocess.run(
+                        ["osascript", "-e",
+                         f"tell application \"System Events\" to set frontmost"
+                         f" of first process whose unix id is {os.getpid()}"
+                         f" to true"],
+                        check=False, capture_output=True, timeout=2)
+                except Exception:
+                    pass
+            return
         if platform.system() != "Windows":
             return
         try:
@@ -5543,10 +6313,24 @@ class MainWindow(QMainWindow):
     def action_screenshot(self):
         """区域截图 -> 内嵌到输入框。
 
-        Windows: 用应用内自绘截图(即点即出、且关闭后能可靠置顶聚焦);
-        macOS/Linux: 仍调用系统截图工具(原生体验/权限友好)。
+        Windows/macOS: 用应用内自绘截图(微信式选区 + 标注工具, 即点即出、
+                       关闭后能可靠置顶聚焦);
+        Linux: 仍调用系统截图工具。
         """
-        if platform.system() == "Windows":
+        if platform.system() == "Darwin" and not _macos_has_screen_permission():
+            # 触发 TCC 权限请求弹窗（系统会记录；下次授权后就不再弹）
+            _macos_request_screen_permission()
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.information(
+                self, "需要屏幕录制权限",
+                "请按以下步骤授权截图：\n\n"
+                "1. 点击「打开系统设置」（或前往 系统设置 → 隐私与安全性 → 屏幕录制）\n"
+                "2. 找到 BitFerry，打开右侧开关\n"
+                "3. 完全退出 BitFerry 并重新打开，即可正常截图\n\n"
+                "注：仅需授权一次，之后截图不会再弹此提示。"
+            )
+            return
+        if platform.system() in ("Windows", "Darwin"):
             self._start_inapp_screenshot()
         else:
             self._start_system_screenshot()
@@ -5557,9 +6341,14 @@ class MainWindow(QMainWindow):
             return                       # 已有截图遮罩, 避免重复触发
         self._was_min = self.isMinimized()
         if load_shot_hide_window():
-            # 先最小化本窗口, 等动画结束再抓屏, 避免把自己截进去。
-            self.showMinimized()
-            QTimer.singleShot(220, self._capture_region)
+            if platform.system() == "Darwin":
+                # macOS: 最小化有较长的 genie 动画, 可能被截进去; 用 hide() 立即移除。
+                self.hide()
+                QTimer.singleShot(120, self._capture_region)
+            else:
+                # 先最小化本窗口, 等动画结束再抓屏, 避免把自己截进去。
+                self.showMinimized()
+                QTimer.singleShot(220, self._capture_region)
         else:
             self._capture_region()
 
@@ -5577,6 +6366,9 @@ class MainWindow(QMainWindow):
         self._shot_overlay.show()
         self._shot_overlay.raise_()
         self._shot_overlay.activateWindow()
+        if platform.system() == "Darwin":
+            # 提到菜单栏/Dock 之上并激活, 否则遮罩盖不住顶部菜单栏、也可能拿不到键盘焦点。
+            _macos_raise_overlay(self._shot_overlay)
 
     def _on_inapp_shot_done(self, path):
         self._shot_overlay = None

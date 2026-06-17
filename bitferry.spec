@@ -16,6 +16,10 @@ a = Analysis(
         'PyQt6.QtGui',
         'PyQt6.QtWidgets',
         'PyQt6.sip',
+        # macOS: Dock 图标点击激活窗口 + 屏幕录制权限检查
+        'AppKit',
+        'Quartz',
+        'objc',
     ],
     hookspath=[],
     hooksconfig={},
@@ -74,6 +78,7 @@ app = BUNDLE(
         'CFBundleShortVersionString': '1.0.0',
         'CFBundleVersion': '1.0.0',
         'NSLocalNetworkUsageDescription': 'BitFerry 需要访问局域网以发现并连接设备。',
+        'NSScreenCaptureUsageDescription': 'BitFerry 需要屏幕录制权限以进行区域截图。',
         'NSBluetoothAlwaysUsageDescription': '',
         'LSApplicationCategoryType': 'public.app-category.utilities',
     },
