@@ -173,8 +173,7 @@ dist\BitFerry.exe
 - 点击「**✂ 截图**」按钮，窗口自动隐藏，拖选区域后松手，截图进入输入框。
 
 **方法二：全局快捷键**
-- macOS 默认快捷键：`⌃⇧A`（Control+Shift+A）
-- Windows 默认快捷键：`Ctrl+Shift+A`
+- 默认快捷键（macOS / Windows 统一）：`Alt+Shift+A`（macOS 上 Alt 即 Option 键 `⌥⇧A`）
 - 可点击右上角「**⌨ 快捷键**」自定义快捷键。
 
 截图以缩略图形式内嵌在输入框中，支持与文字混排后一起发送。

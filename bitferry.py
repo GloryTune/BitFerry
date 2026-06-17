@@ -101,7 +101,9 @@ def save_recv_root(path):
     set_setting("recv_root", str(path))
 
 
-DEFAULT_SHORTCUT = "Ctrl+Shift+A" if platform.system() != "Darwin" else "Meta+Shift+A"
+# 两端统一用 Alt+Shift+A(macOS 上 Alt 即 Option 键): 不与系统/常见应用的截图
+# 快捷键冲突, 且好按。
+DEFAULT_SHORTCUT = "Alt+Shift+A"
 
 
 def _read_settings():
@@ -3998,7 +4000,7 @@ class ShortcutDialog(QDialog):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(22, 20, 22, 18)
         lay.setSpacing(12)
-        tip = QLabel("点击下方方框，然后按下你想要的组合键\n（例如 Ctrl+Shift+A）。窗口在前台时生效。")
+        tip = QLabel("点击下方方框，然后按下你想要的组合键\n（默认 Alt+Shift+A）。窗口在前台时生效。")
         tip.setObjectName("selfIp")
         tip.setWordWrap(True)
         lay.addWidget(tip)
@@ -4114,7 +4116,7 @@ class SettingsDialog(QDialog):
         sc_title = QLabel("截图快捷键")
         sc_title.setObjectName("selfName")
         sc_lay.addWidget(sc_title)
-        sc_hint = QLabel("点击下方框后按下组合键（例如 Ctrl+Shift+A）")
+        sc_hint = QLabel("点击下方框后按下组合键（默认 Alt+Shift+A）")
         sc_hint.setObjectName("selfLabel")
         sc_lay.addWidget(sc_hint)
         self.shortcut_cap = ShortcutCapture(load_shortcut())
