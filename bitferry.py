@@ -166,6 +166,51 @@ def load_remember_window():
     return bool(get_setting("remember_window", True))
 
 
+def load_close_to_tray():
+    """点关闭按钮时是否最小化到托盘(而非退出), 默认开启。"""
+    return bool(get_setting("close_to_tray", True))
+
+
+_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_RUN_NAME = "BitFerry"
+
+
+def _autostart_command():
+    if getattr(sys, "frozen", False):       # PyInstaller 打包后
+        return f'"{sys.executable}"'
+    return f'"{sys.executable}" "{os.path.abspath(__file__)}"'
+
+
+def is_autostart_enabled() -> bool:
+    if platform.system() != "Windows":
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY) as k:
+            val, _ = winreg.QueryValueEx(k, _RUN_NAME)
+            return bool(val)
+    except OSError:
+        return False
+
+
+def set_autostart(enabled: bool):
+    if platform.system() != "Windows":
+        return
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY, 0,
+                            winreg.KEY_SET_VALUE) as k:
+            if enabled:
+                winreg.SetValueEx(k, _RUN_NAME, 0, winreg.REG_SZ, _autostart_command())
+            else:
+                try:
+                    winreg.DeleteValue(k, _RUN_NAME)
+                except FileNotFoundError:
+                    pass
+    except OSError:
+        pass
+
+
 def load_offline_queue():
     try:
         return json.loads(OFFLINE_QUEUE_FILE.read_text(encoding="utf-8"))
@@ -3405,6 +3450,18 @@ class SettingsDialog(QDialog):
         wb_lay.addWidget(self.chk_focus_shot)
         wb_lay.addWidget(self.chk_focus_recv)
 
+        # 关闭=最小化到托盘 / 开机自启动
+        self.chk_close_tray = QCheckBox("关闭窗口时最小化到托盘（不退出，可从托盘退出）")
+        self.chk_close_tray.setStyleSheet(f"color:{rc}; font-size:12px;")
+        self.chk_close_tray.setChecked(load_close_to_tray())
+        wb_lay.addWidget(self.chk_close_tray)
+        self.chk_autostart = None
+        if platform.system() == "Windows":
+            self.chk_autostart = QCheckBox("开机时自动启动 BitFerry（常驻托盘随时收文件）")
+            self.chk_autostart.setStyleSheet(f"color:{rc}; font-size:12px;")
+            self.chk_autostart.setChecked(is_autostart_enabled())
+            wb_lay.addWidget(self.chk_autostart)
+
         # 记住上次窗口大小和位置(默认开启)
         self.chk_remember_win = QCheckBox("下次打开时保持上次的窗口大小和位置")
         self.chk_remember_win.setStyleSheet(f"color:{rc}; font-size:12px;")
@@ -3527,6 +3584,9 @@ class SettingsDialog(QDialog):
         set_setting("focus_after_shot", self.chk_focus_shot.isChecked())
         set_setting("focus_on_recv", self.chk_focus_recv.isChecked())
         set_setting("remember_window", self.chk_remember_win.isChecked())
+        set_setting("close_to_tray", self.chk_close_tray.isChecked())
+        if self.chk_autostart is not None:
+            set_autostart(self.chk_autostart.isChecked())
         # 仅当用户这次明确点了某个预设时, 才立即把窗口调成该尺寸
         if self._size_explicit:
             w, h = self._win_size_choice
@@ -4159,7 +4219,7 @@ class MainWindow(QMainWindow):
         self.signals.recv_cancelled.connect(self._on_recv_cancelled)
         self.signals.msgs_delivered.connect(self._on_msgs_delivered)
 
-        self.setWindowTitle("BitFerry 内网互传")
+        self.setWindowTitle("BitFerry 内网快传")
         self.setMinimumSize(*MIN_WIN_SIZE)
         restored = False
         if load_remember_window():
@@ -4174,6 +4234,8 @@ class MainWindow(QMainWindow):
             self.resize(*load_window_size())
         self._build_ui()
         self.setStyleSheet(STYLE)
+        self._force_quit = False
+        self._tray_notified = False
         self._build_tray()
         self._shot_shortcut = None
         self._global_hotkey = None
@@ -4228,13 +4290,23 @@ class MainWindow(QMainWindow):
             icon = self._make_icon()
             self.setWindowIcon(icon)
             self.tray = QSystemTrayIcon(icon, self)
-            self.tray.setToolTip("BitFerry 内网互传")
+            self.tray.setToolTip("BitFerry 内网快传")
             menu = QMenu()
             act_show = QAction("显示窗口", self)
             act_show.triggered.connect(self._restore_window)
+            act_shot = QAction("截图", self)
+            act_shot.triggered.connect(self.action_screenshot)
+            act_recv = QAction("打开接收目录", self)
+            act_recv.triggered.connect(self.action_open_recv)
+            act_setting = QAction("设置", self)
+            act_setting.triggered.connect(self._tray_open_settings)
             act_quit = QAction("退出", self)
-            act_quit.triggered.connect(QApplication.quit)
+            act_quit.triggered.connect(self._tray_quit)
             menu.addAction(act_show)
+            menu.addSeparator()
+            menu.addAction(act_shot)
+            menu.addAction(act_recv)
+            menu.addAction(act_setting)
             menu.addSeparator()
             menu.addAction(act_quit)
             self.tray.setContextMenu(menu)
@@ -4247,6 +4319,45 @@ class MainWindow(QMainWindow):
         if reason in (QSystemTrayIcon.ActivationReason.Trigger,
                       QSystemTrayIcon.ActivationReason.DoubleClick):
             self._restore_window()
+
+    def _tray_open_settings(self):
+        # 从托盘打开设置: 先把窗口带到前台, 设置对话框才不会落在后面
+        self._bring_to_front()
+        self.action_settings()
+
+    def _tray_quit(self):
+        self._force_quit = True
+        self.close()
+        QApplication.quit()
+
+    def _tray_icon_with_badge(self, count: int) -> QIcon:
+        """在托盘图标右上角叠加未读数角标。"""
+        if getattr(self, "_tray_base_pix", None) is None:
+            self._tray_base_pix = self._make_icon().pixmap(QSize(64, 64))
+        base = self._tray_base_pix
+        if count <= 0:
+            return QIcon(base)
+        pm = QPixmap(base)
+        # 注意: 高 DPI 下 pm.width() 是物理像素, 而 painter 工作在逻辑坐标,
+        # 必须用逻辑宽度定位角标, 否则会画到图标外面。
+        dpr = pm.devicePixelRatio() or 1.0
+        logical_w = pm.width() / dpr
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        d = 32
+        x, y = int(logical_w - d - 1), 1
+        p.setBrush(QColor("#FF3B30"))
+        p.setPen(QPen(QColor("#FFFFFF"), 2))
+        p.drawEllipse(x, y, d, d)
+        txt = "99+" if count > 99 else str(count)
+        p.setPen(QColor("#FFFFFF"))
+        f = QFont()
+        f.setBold(True)
+        f.setPixelSize(20 if len(txt) < 3 else 13)
+        p.setFont(f)
+        p.drawText(QRect(x, y, d, d), Qt.AlignmentFlag.AlignCenter, txt)
+        p.end()
+        return QIcon(pm)
 
     def _restore_window(self):
         self._bring_to_front()
@@ -4348,7 +4459,7 @@ class MainWindow(QMainWindow):
         sb.setSpacing(12)
 
         sb.addWidget(self._lbl("BitFerry", "brand"))
-        sb.addWidget(self._lbl("内网互传", "brandSub"))
+        sb.addWidget(self._lbl("内网快传", "brandSub"))
         # 全局按钮行: 设置 / 目录(任何时候都显示, 不依赖是否选中设备)
         gact = QHBoxLayout()
         gact.setSpacing(8)
@@ -4954,13 +5065,14 @@ class MainWindow(QMainWindow):
     def _update_title_unread(self):
         total = sum(self.unread.values())
         if total > 0:
-            self.setWindowTitle(f"({total}) BitFerry 内网互传")
+            self.setWindowTitle(f"({total}) BitFerry 内网快传")
         else:
-            self.setWindowTitle("BitFerry 内网互传")
-        # 托盘图标提示
+            self.setWindowTitle("BitFerry 内网快传")
+        # 托盘图标提示 + 未读角标
         if getattr(self, "tray", None) is not None:
-            tip = f"BitFerry · {total} 条未读" if total else "BitFerry 内网互传"
+            tip = f"BitFerry · {total} 条未读" if total else "BitFerry 内网快传"
             self.tray.setToolTip(tip)
+            self.tray.setIcon(self._tray_icon_with_badge(total))
 
     # ========== 待发内容: 图片走输入框内嵌, 文件/文件夹走 chip 行 ==========
     def _refresh_chips(self):
@@ -5623,12 +5735,29 @@ class MainWindow(QMainWindow):
         super().changeEvent(event)
 
     def closeEvent(self, event):
+        # 记住窗口大小/位置(无论最小化到托盘还是真正退出都记一次)
         if load_remember_window():
             try:
                 geom = bytes(self.saveGeometry().toBase64()).decode("ascii")
                 set_setting("window_geom", geom)
             except Exception:
                 pass
+        # 关闭 = 最小化到托盘(而非退出)
+        if (not self._force_quit and load_close_to_tray()
+                and getattr(self, "tray", None) is not None):
+            event.ignore()
+            self.hide()
+            if not self._tray_notified:
+                self._tray_notified = True
+                try:
+                    self.tray.showMessage(
+                        "BitFerry 仍在后台运行",
+                        "已最小化到托盘，可从托盘图标打开或退出。",
+                        QSystemTrayIcon.MessageIcon.Information, 3000)
+                except Exception:
+                    pass
+            return
+        # 真正退出: 清理资源
         self.discovery.stop()
         self.receiver.stop()
         self._save_history()
