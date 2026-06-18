@@ -3218,14 +3218,12 @@ class Signals(QObject):
     staged = pyqtSignal(str)                      # 截图完成后回主线程放入待发区(图片路径)
     win_hide = pyqtSignal()                       # 截图前隐藏窗口(主线程)
     win_show = pyqtSignal()                       # 截图后恢复窗口(主线程)
-    send_progress = pyqtSignal(str, int, int, float)        # filename, done, total, speed_bps
     recv_started  = pyqtSignal(str, str, str, str)          # recv_id, sender_name, sender_ip, meta_json
     recv_progress = pyqtSignal(str, str, int, int, float)   # recv_id, filename, done, total, speed_bps
-    send_done = pyqtSignal()
-    send_cancelled = pyqtSignal(str)                        # msg_id — 发送方主动取消
+    send_unit_progress = pyqtSignal(str, int, int, float)  # unit_id, done, total, speed
+    send_unit_result = pyqtSignal(str, str, str)           # unit_id, status(ok/cancelled/error), reason
     recv_done = pyqtSignal(str)                             # recv_id
     recv_cancelled = pyqtSignal(str)                        # recv_id — 发送方取消传输
-    msgs_delivered = pyqtSignal(str, int)                   # ip, count — 离线消息送达通知
 
 
 # ----------------------------- 聊天气泡 -----------------------------
@@ -3394,102 +3392,6 @@ class ClickableImage(QLabel):
                 subprocess.run(["xdg-open", str(Path(self.path).parent)])
         except Exception:
             pass
-
-
-class RecvCard(QFrame):
-    """接收方占位卡 - 图片或文件传输中显示环形进度动画，完成后由真实气泡替换。"""
-    _registry: dict = {}   # recv_id → RecvCard
-
-    def __init__(self, recv_id, item_type, fname="", size_bytes=0):
-        super().__init__()
-        self._recv_id = recv_id
-        self._item_type = item_type
-        self._fname = fname
-        self._size_bytes = size_bytes
-        self._progress = 0.0
-        self._speed = 0.0
-        self._transferring = True
-        RecvCard._registry[recv_id] = self
-        self.setObjectName("recvCard")
-
-        if item_type == "image":
-            self.setFixedSize(200, 150)
-        else:
-            # 文件型：与 FileCard 相同布局，圆环在左，文件名/大小在右
-            self.setFixedSize(280, 56)
-            lay = QHBoxLayout(self)
-            lay.setContentsMargins(52, 8, 14, 8)
-            lay.setSpacing(10)
-            col = QVBoxLayout()
-            col.setSpacing(2)
-            nm = QLabel(fname or "文件")
-            nm.setObjectName("fileCardName")
-            nm.setMaximumWidth(200)
-            sz_text = human_size(size_bytes) if size_bytes else "接收中…"
-            sz = QLabel(sz_text)
-            sz.setObjectName("fileCardSize")
-            col.addWidget(nm)
-            col.addWidget(sz)
-            lay.addLayout(col, 1)
-
-    @classmethod
-    def remove(cls, recv_id):
-        """主动从注册表移除（在 deleteLater 之前调用，防止后续信号访问已删除对象）。"""
-        cls._registry.pop(recv_id, None)
-
-    @classmethod
-    def update_progress(cls, recv_id, pct, speed) -> bool:
-        card = cls._registry.get(recv_id)
-        if card is None or not card._transferring:
-            return False
-        try:
-            card._progress = pct
-            card._speed = speed
-            card.update()
-            return True
-        except RuntimeError:
-            cls._registry.pop(recv_id, None)
-            return False
-
-    def paintEvent(self, event):
-        super().paintEvent(event)
-        if not self._transferring:
-            return
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        # 图片型：整卡暗蒙层 + 居中圆环
-        if self._item_type == "image":
-            p.fillRect(self.rect(), QColor(20, 24, 34, 220))
-            cx, cy = self.width() // 2, self.height() // 2
-        else:
-            # 文件型：只在左侧圆环区域叠半透明蒙层，保留右侧文字可读
-            p.fillRect(0, 0, 48, self.height(), QColor(20, 24, 34, 180))
-            cx, cy = 26, self.height() // 2
-        R_out, R_in = 17, 10
-        p.setPen(QPen(QColor(255, 255, 255, 45), 1.0))
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawEllipse(cx - R_out, cy - R_out, R_out * 2, R_out * 2)
-        if self._progress > 0:
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(_theme_accent(230))
-            span = -int(self._progress * 360 * 16)
-            p.drawPie(cx - R_out, cy - R_out, R_out * 2, R_out * 2, 90 * 16, span)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(20, 24, 34, 210))
-        p.drawEllipse(cx - R_in, cy - R_in, R_in * 2, R_in * 2)
-        if self._progress > 0:
-            p.setPen(QColor(255, 255, 255, 220))
-            f = QFont(); f.setPixelSize(8); f.setBold(True)
-            p.setFont(f)
-            p.drawText(QRectF(cx - R_in, cy - R_in, R_in * 2, R_in * 2),
-                       Qt.AlignmentFlag.AlignCenter, f"{int(self._progress * 100)}%")
-        if self._speed > 0 and self._item_type == "image":
-            p.setPen(QColor(160, 175, 200, 200))
-            f2 = QFont(); f2.setPixelSize(10); p.setFont(f2)
-            p.drawText(self.rect().adjusted(0, cy + R_out + 4, 0, 0),
-                       Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
-                       _human_speed(self._speed))
-        p.end()
 
 
 class FileCard(QFrame):
@@ -3859,6 +3761,8 @@ class Bubble(QFrame):
             return [{"type": "text", "text": payload}]
         if kind == "image":
             return [{"type": "image", "path": payload}]
+        if kind == "notice":
+            return [{"type": "notice", "text": payload}]
         return [{"type": "text", "text": str(payload)}]
 
     def _add_part(self, bl, part, mine):
@@ -3886,6 +3790,17 @@ class Bubble(QFrame):
             bl.addWidget(FileCard(part.get("name", "文件"),
                                   part.get("size", 0),
                                   part.get("path", ""), mine))
+        elif t == "notice":
+            txt = part.get("text", "")
+            if not txt:
+                return
+            lbl = QLabel(txt)
+            lbl.setObjectName("bubbleNotice")
+            lbl.setWordWrap(True)
+            lbl.setMaximumWidth(420)
+            lbl.setStyleSheet("color:#e05a4f; font-size:12px;")
+            lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            bl.addWidget(lbl)
 
 
 class AttachChip(QFrame):
@@ -4349,29 +4264,34 @@ class SettingsDialog(QDialog):
         return self.radio_confirm.isChecked()
 
 
-# ----------------------------- 传输进度条控件 -----------------------------
-class TransferProgressWidget(QFrame):
-    """聊天区顶部的传输进度横幅（发送/接收时自动显示，完成后渐隐）。"""
-
-    def __init__(self, parent=None):
+class TransferRow(QFrame):
+    """传输队列里的一行: 方向图标 + 名称 + 进度条 + 速度 (+ 发送时的暂停/取消)。
+    direction: send/recv; controllable=True 时显示暂停/取消(仅发送)。"""
+    def __init__(self, unit_id, label, direction="send", controllable=True,
+                 on_pause=None, on_cancel=None, parent=None):
         super().__init__(parent)
+        self.unit_id = unit_id
+        self.paused = False
         self.setObjectName("xferBanner")
-        self.setFixedHeight(52)
+        self.setFixedHeight(46)
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(16, 0, 16, 0)
+        lay.setContentsMargins(16, 4, 16, 4)
         lay.setSpacing(10)
 
-        self.dir_lbl = QLabel("↑")
+        self.dir_lbl = QLabel("↑" if direction == "send" else "↓")
         self.dir_lbl.setObjectName("xferIcon")
-        self.dir_lbl.setFixedWidth(18)
+        self.dir_lbl.setFixedWidth(16)
         lay.addWidget(self.dir_lbl)
 
-        info_col = QVBoxLayout()
-        info_col.setSpacing(3)
-        self.name_lbl = QLabel("")
+        col = QVBoxLayout()
+        col.setSpacing(2)
+        name = Path(label).name if label else label
+        if len(name) > 34:
+            name = name[:31] + "…"
+        verb = "正在发送: " if direction == "send" else "正在接收: "
+        self.name_lbl = QLabel(verb + name)
         self.name_lbl.setObjectName("xferName")
-        info_col.addWidget(self.name_lbl)
-
+        col.addWidget(self.name_lbl)
         bar_row = QHBoxLayout()
         bar_row.setSpacing(8)
         self.bar = QProgressBar()
@@ -4385,102 +4305,90 @@ class TransferProgressWidget(QFrame):
         self.pct_lbl.setObjectName("xferPct")
         self.pct_lbl.setFixedWidth(34)
         bar_row.addWidget(self.pct_lbl)
-        info_col.addLayout(bar_row)
-        lay.addLayout(info_col, 1)
+        col.addLayout(bar_row)
+        lay.addLayout(col, 1)
 
         self.speed_lbl = QLabel("")
         self.speed_lbl.setObjectName("xferSpeed")
-        self.speed_lbl.setFixedWidth(72)
+        self.speed_lbl.setFixedWidth(70)
         self.speed_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         lay.addWidget(self.speed_lbl)
 
-        # 暂停/继续 + 取消 按钮（仅发送时显示）
-        self._btn_pause = QPushButton("⏸ 暂停")
-        self._btn_pause.setObjectName("xferBtnPause")
-        self._btn_pause.setFixedHeight(28)
-        self._btn_pause.setMinimumWidth(64)
-        self._btn_pause.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._btn_pause.setToolTip("暂停发送")
-        self._btn_pause.clicked.connect(self._on_pause_clicked)
-        lay.addWidget(self._btn_pause)
-
-        self._btn_cancel = QPushButton("✕ 取消")
-        self._btn_cancel.setObjectName("xferBtnCancel")
-        self._btn_cancel.setFixedHeight(28)
-        self._btn_cancel.setMinimumWidth(64)
-        self._btn_cancel.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._btn_cancel.setToolTip("取消发送")
-        self._btn_cancel.clicked.connect(self._on_cancel_clicked)
-        lay.addWidget(self._btn_cancel)
-
-        self._ctrl: "TransferControl | None" = None
-        self._hide_timer = QTimer(self)
-        self._hide_timer.setSingleShot(True)
-        self._hide_timer.timeout.connect(self.hide)
-        self.hide()
-
-    def _on_pause_clicked(self):
-        if not self._ctrl:
-            return
-        if self._ctrl.is_paused:
-            self._ctrl.resume()
-            self._btn_pause.setText("⏸ 暂停")
-            self._btn_pause.setToolTip("暂停发送")
-            self.name_lbl.setStyleSheet("")
+        if controllable:
+            self._btn_pause = QPushButton("⏸")
+            self._btn_pause.setObjectName("xferBtnPause")
+            self._btn_pause.setFixedSize(30, 26)
+            self._btn_pause.setCursor(Qt.CursorShape.PointingHandCursor)
+            self._btn_pause.setToolTip("暂停")
+            self._btn_pause.clicked.connect(lambda: on_pause and on_pause(self))
+            lay.addWidget(self._btn_pause)
+            self._btn_cancel = QPushButton("✕")
+            self._btn_cancel.setObjectName("xferBtnCancel")
+            self._btn_cancel.setFixedSize(30, 26)
+            self._btn_cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+            self._btn_cancel.setToolTip("取消此文件")
+            self._btn_cancel.clicked.connect(lambda: on_cancel and on_cancel(self))
+            lay.addWidget(self._btn_cancel)
         else:
-            self._ctrl.pause()
-            self._btn_pause.setText("▶ 继续")
-            self._btn_pause.setToolTip("继续发送")
-            self.name_lbl.setStyleSheet(f"color:{_theme_color('warn')};")
+            self._btn_pause = None
+            self._btn_cancel = None
 
-    def _on_cancel_clicked(self):
-        if self._ctrl:
-            self._ctrl.cancel()
-
-    def start_transfer(self, direction: str, filename: str,
-                       ctrl: "TransferControl | None" = None):
-        self._hide_timer.stop()
-        self._ctrl = ctrl
-        self.dir_lbl.setText("↑" if direction == "send" else "↓")
-        fname = Path(filename).name if filename else filename
-        if len(fname) > 36:
-            fname = fname[:33] + "…"
-        self.name_lbl.setText(("正在发送: " if direction == "send" else "正在接收: ") + fname)
-        self.name_lbl.setStyleSheet("")
-        self.bar.setValue(0)
-        self.pct_lbl.setText("0%")
-        self.speed_lbl.setText("")
-        show_ctrl = (direction == "send" and ctrl is not None)
-        self._btn_pause.setVisible(show_ctrl)
-        self._btn_cancel.setVisible(show_ctrl)
-        if show_ctrl:
-            self._btn_pause.setText("⏸ 暂停")
-        self.show()
-
-    def update_progress(self, done: int, total: int, speed: float):
+    def set_progress(self, done, total, speed):
         if total > 0:
             pct = min(100, int(done * 100 / total))
             self.bar.setValue(pct)
             self.pct_lbl.setText(f"{pct}%")
         self.speed_lbl.setText(_human_speed(speed))
 
-    def finish(self):
-        self._ctrl = None
-        self.bar.setValue(100)
-        self.pct_lbl.setText("100%")
-        self._btn_pause.setVisible(False)
-        self._btn_cancel.setVisible(False)
-        self.name_lbl.setStyleSheet("")
-        self._hide_timer.start(1800)
+    def set_paused(self, paused):
+        self.paused = paused
+        if self._btn_pause:
+            self._btn_pause.setText("▶" if paused else "⏸")
+            self._btn_pause.setToolTip("继续" if paused else "暂停")
+        self.name_lbl.setStyleSheet(
+            f"color:{_theme_color('warn')};" if paused else "")
 
-    def cancel_ui(self):
-        """取消时立即收起横幅，不显示 100% 完成态。"""
-        self._ctrl = None
-        self._hide_timer.stop()
-        self._btn_pause.setVisible(False)
-        self._btn_cancel.setVisible(False)
-        self.name_lbl.setStyleSheet("")
+
+class TransferQueueWidget(QFrame):
+    """统一传输队列: 发送/接收各占一行显示进度; 发送行可暂停/取消。空时自动隐藏。"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("sendQueue")
+        self._lay = QVBoxLayout(self)
+        self._lay.setContentsMargins(0, 0, 0, 0)
+        self._lay.setSpacing(1)
+        self._rows = {}   # unit_id -> TransferRow
         self.hide()
+
+    def add_unit(self, unit_id, label, direction="send", controllable=True,
+                 on_pause=None, on_cancel=None):
+        if unit_id in self._rows:
+            return
+        row = TransferRow(unit_id, label, direction, controllable, on_pause, on_cancel)
+        self._rows[unit_id] = row
+        self._lay.addWidget(row)
+        self.show()
+
+    def update_unit(self, unit_id, done, total, speed):
+        r = self._rows.get(unit_id)
+        if r:
+            r.set_progress(done, total, speed)
+
+    def set_paused(self, unit_id, paused):
+        r = self._rows.get(unit_id)
+        if r:
+            r.set_paused(paused)
+
+    def has(self, unit_id):
+        return unit_id in self._rows
+
+    def remove_unit(self, unit_id):
+        r = self._rows.pop(unit_id, None)
+        if r:
+            self._lay.removeWidget(r)
+            r.deleteLater()
+        if not self._rows:
+            self.hide()
 
 
 # ----------------------------- 网段设置弹窗 -----------------------------
@@ -4994,9 +4902,10 @@ class MainWindow(QMainWindow):
         self.offline_queue = load_offline_queue()  # ip -> [{send_items, record_parts, ts}]
         self.staged_receives = {}              # ip -> [{parts, ts, name}] 待确认接收
         self._peer_list_state = {}             # 用于跳过无变化的重绘
-        self._recv_placeholders = {}           # recv_id -> (sender_ip, QWidget)
+        self._recv_meta = {}                   # recv_id -> {ip, label} 进行中的接收
         self._bubbles_by_id = {}               # msg_id -> Bubble 组件（用于取消时撤回气泡）
         self._send_ctrl: TransferControl | None = None   # 当前发送控制器
+        self._send_units = {}    # unit_id -> {ctrl, ip, label, record} 在线按文件发送
 
         self.signals = Signals()
         self.signals.peers_changed.connect(self._on_peers_change)
@@ -5006,14 +4915,12 @@ class MainWindow(QMainWindow):
         self.signals.staged.connect(self._stage_screenshot)
         self.signals.win_hide.connect(self._hide_for_shot)
         self.signals.win_show.connect(self._restore_after_shot)
-        self.signals.send_progress.connect(self._on_send_progress)
         self.signals.recv_progress.connect(self._on_recv_progress)
-        self.signals.send_done.connect(self._on_send_done)
-        self.signals.send_cancelled.connect(self._on_send_cancelled)
+        self.signals.send_unit_progress.connect(self._on_send_unit_progress)
+        self.signals.send_unit_result.connect(self._on_send_unit_result)
         self.signals.recv_done.connect(self._on_recv_done)
         self.signals.recv_started.connect(self._on_recv_started)
         self.signals.recv_cancelled.connect(self._on_recv_cancelled)
-        self.signals.msgs_delivered.connect(self._on_msgs_delivered)
 
         # macOS: 点击 Dock 图标时 QApplication 会发 ApplicationActive 状态,
         # 借此将被 hide() 隐藏的窗口还原到前台。
@@ -5564,8 +5471,8 @@ class MainWindow(QMainWindow):
         cl.addWidget(header)
 
         # 传输进度横幅
-        self.xfer_progress = TransferProgressWidget()
-        cl.addWidget(self.xfer_progress)
+        self.transfer_queue = TransferQueueWidget()
+        cl.addWidget(self.transfer_queue)
 
         # 待确认接收横幅
         self.recv_pending_banner = QFrame()
@@ -5897,7 +5804,7 @@ class MainWindow(QMainWindow):
 
     # ---------- 聊天渲染 ----------
     def _clear_chat_canvas(self):
-        self._recv_placeholders.clear()  # frames about to be deleted
+        # 接收进度行在顶部队列里(不属于聊天画布), 切换会话时不清除
         self._bubbles_by_id.clear()      # 气泡组件即将被删除
         while self.chat_layout.count() > 1:  # 保留末尾 stretch
             item = self.chat_layout.takeAt(0)
@@ -5986,6 +5893,8 @@ class MainWindow(QMainWindow):
 
     def _preview_text(self, kind, payload):
         if kind == "text":
+            return payload if len(payload) <= 40 else payload[:40] + "…"
+        if kind == "notice":
             return payload if len(payload) <= 40 else payload[:40] + "…"
         if kind == "image":
             return "[图片]"
@@ -6121,91 +6030,78 @@ class MainWindow(QMainWindow):
             return None  # 由调用方决定如何处理离线
         return ip
 
-    def _build_send_items(self):
-        """从输入框和 pending chip 构建 send_items / record_parts。"""
+    def _build_send_units(self):
+        """在线发送用: 拆成 文字单元(文字+内嵌图片) + 每个文件/文件夹一个单元。
+        返回 (text_items, text_record, file_units) 或 None。
+        file_units: [{send_items, record, label}]。"""
         content_parts = self.input.extract_content()
         has_input = any(
             (p["type"] == "text" and p["text"].strip()) or p["type"] == "image"
             for p in content_parts)
         if not has_input and not self.pending:
-            return None, None
-
-        send_items = []
-        record_parts = []
+            return None
+        text_items, text_record = [], []
         for p in content_parts:
             if p["type"] == "text" and p["text"].strip():
-                send_items.append({"type": "text", "text": p["text"]})
-                record_parts.append({"type": "text", "text": p["text"]})
+                text_items.append({"type": "text", "text": p["text"]})
+                text_record.append({"type": "text", "text": p["text"]})
             elif p["type"] == "image":
-                send_items.append({"type": "image", "path": p["path"]})
-                record_parts.append({"type": "image", "path": p["path"]})
+                text_items.append({"type": "image", "path": p["path"]})
+                text_record.append({"type": "image", "path": p["path"]})
+        file_units = []
         for it in self.pending:
             if it["type"] == "file":
-                send_items.append({"type": "file", "path": it["path"]})
-                record_parts.append({"type": "file", "name": it["name"],
-                                     "size": self._safe_size(it["path"]),
-                                     "path": it["path"]})
+                rec = {"type": "file", "name": it["name"],
+                       "size": self._safe_size(it["path"]), "path": it["path"]}
+                file_units.append({
+                    "send_items": [{"type": "file", "path": it["path"]}],
+                    "record": rec, "label": it["name"]})
             elif it["type"] == "folder":
                 root = Path(it["path"])
                 files = [f for f in root.rglob("*") if f.is_file()]
+                sitems = []
                 for f in files:
                     rel = str(Path(root.name) / f.relative_to(root))
-                    send_items.append({"type": "file", "path": str(f), "relpath": rel})
-                record_parts.append({"type": "file",
-                                     "name": f"{it['name']}/（{it['count']} 个文件）",
-                                     "size": 0, "path": str(root)})
-        return send_items, record_parts
+                    sitems.append({"type": "file", "path": str(f), "relpath": rel})
+                rec = {"type": "file",
+                       "name": f"{it['name']}/（{it['count']} 个文件）",
+                       "size": 0, "path": str(root)}
+                file_units.append({"send_items": sitems, "record": rec,
+                                   "label": it["name"]})
+        return text_items, text_record, file_units
 
     def action_send(self):
-        """把输入框内容(文字+内嵌图片, 按顺序) + 文件chip 作为一个消息块发出。"""
+        """文字+内嵌图片作为一条消息立即显示; 每个文件/文件夹独立进入发送队列,
+        各自可暂停/取消, 传完才在聊天里显示, 取消/失败则显示失败说明。"""
         ip = self.current_ip
         if not ip:
             QMessageBox.information(self, "选择设备", "请先在左侧选择一台设备。")
             return
 
-        send_items, record_parts = self._build_send_items()
-        if send_items is None:
-            return
-
         offline = not self._peer_online(ip)
-        msg_id = str(uuid.uuid4())
 
-        # 在线发送时，先结束旧的进度动画，再注册新文件到待传集合
-        if not offline:
-            FileCard.finish_all_transfers()
-            ClickableImage.finish_all_transfers()
-            FileCard._pending_transfer_names = {
-                Path(it["path"]).name
-                for it in send_items if it.get("type") == "file" and it.get("path")
-            }
-            ClickableImage._pending_transfer_paths = {
-                it["path"]
-                for it in send_items if it.get("type") == "image" and it.get("path")
-            }
-
-        # 立刻把消息显示到聊天框（乐观 UI），离线时加 pending 标记
-        rec = self._store_msg(ip, "batch",
-                              json.dumps(record_parts, ensure_ascii=False),
-                              True, self.hostname,
-                              pending=offline, msg_id=msg_id)
-        if self.current_ip == ip:
-            self._add_bubble_widget(rec)
-            QTimer.singleShot(20, self._scroll_bottom)
-
-        # 气泡创建完成，清空待传集合（FileCard/ClickableImage 已通过 __init__ 读取）
-        FileCard._pending_transfer_names = set()
-        ClickableImage._pending_transfer_paths = set()
-
-        # 清空输入区
-        self.input.reset()
-        self.pending.clear()
-        self._refresh_chips()
-
+        # ---------- 离线: 文字乐观显示(⏳), 文件入队, 上线后按统一方式补发 ----------
         if offline:
-            # 静默入队，等对方上线自动发
+            built = self._build_send_units()
+            if built is None:
+                return
+            text_items, text_record, file_units = built
+            self.input.reset()
+            self.pending.clear()
+            self._refresh_chips()
+            msg_id = str(uuid.uuid4())
+            if text_items:
+                rec = self._store_msg(
+                    ip, "batch", json.dumps(text_record, ensure_ascii=False),
+                    True, self.hostname, pending=True, msg_id=msg_id)
+                if self.current_ip == ip:
+                    self._add_bubble_widget(rec)
+                    QTimer.singleShot(20, self._scroll_bottom)
+            # 文件不再乐观显示, 上线后真正送达时才出现(失败则给说明)
             self.offline_queue.setdefault(ip, []).append({
-                "send_items": send_items,
-                "record_parts": record_parts,
+                "text_items": text_items,
+                "text_record": text_record,
+                "file_units": file_units,
                 "msg_id": msg_id,
                 "ts": now_hm(),
             })
@@ -6214,29 +6110,128 @@ class MainWindow(QMainWindow):
             self._rebuild_peer_list()
             return
 
-        # 在线: 后台发送，进度回调
+        # ---------- 在线: 文字单元立即显示, 文件单元进队列逐个发送 ----------
+        built = self._build_send_units()
+        if built is None:
+            return
+        text_items, text_record, file_units = built
         port = self._peer_port(ip)
-        first_name = next((it.get("path", "") or it.get("name", "")
-                           for it in send_items if it["type"] != "text"), "")
-        has_binary = any(it["type"] in ("file", "image") for it in send_items)
-        ctrl = TransferControl() if has_binary else None
-        self._send_ctrl = ctrl
-        if ctrl and first_name:
-            # 立即展开进度横幅，让暂停/取消按钮立即可见
-            fname = Path(first_name).name if first_name else first_name
-            self.xfer_progress.start_transfer("send", fname, ctrl)
+
+        # 清空输入区
+        self.input.reset()
+        self.pending.clear()
+        self._refresh_chips()
+
+        # 1) 文字 + 内嵌图片: 立即显示一条消息, 后台静默发送
+        if text_items:
+            rec = self._store_msg(ip, "batch",
+                                  json.dumps(text_record, ensure_ascii=False),
+                                  True, self.hostname)
+            if self.current_ip == ip:
+                self._add_bubble_widget(rec)
+                QTimer.singleShot(20, self._scroll_bottom)
+            self._send_text_unit(ip, port, text_items)
+
+        # 2) 文件/文件夹: 进入顶部队列逐个发送
+        self._start_file_units(ip, port, file_units)
+
+    def _send_text_unit(self, ip, port, text_items):
+        """后台静默发送文字+内嵌图片这一条消息(气泡已在别处显示)。"""
+        if not text_items:
+            return
 
         def do():
-            def on_prog(fn, done, total, speed):
-                self.signals.send_progress.emit(fn, done, total, speed)
-            status = send_batch(send_items, ip, port, self.hostname,
-                                lambda m, k="send": self.signals.log.emit(m, k),
-                                on_progress=on_prog, first_name=first_name, ctrl=ctrl)
-            if status == "cancelled":
-                self.signals.send_cancelled.emit(msg_id)
-            else:
-                self.signals.send_done.emit()
+            send_batch(text_items, ip, port, self.hostname,
+                       lambda m, k="send": self.signals.log.emit(m, k))
         threading.Thread(target=do, daemon=True).start()
+
+    def _start_file_units(self, ip, port, file_units):
+        """文件/文件夹单元: 注册到顶部队列并顺序发送, 各自可暂停/取消;
+        传完插入对应气泡, 取消/失败插入失败说明。在线发送与离线补发共用。"""
+        if not file_units:
+            return
+        units = []
+        for u in file_units:
+            uid = str(uuid.uuid4())
+            self._send_units[uid] = {
+                "ctrl": TransferControl(), "ip": ip,
+                "label": u["label"], "record": u["record"]}
+            self.transfer_queue.add_unit(
+                uid, u["label"], direction="send", controllable=True,
+                on_pause=self._on_queue_pause, on_cancel=self._on_queue_cancel)
+            units.append((uid, u["send_items"]))
+
+        def worker():
+            for uid, sitems in units:
+                meta = self._send_units.get(uid)
+                if meta is None:
+                    continue
+                ctrl = meta["ctrl"]
+                if ctrl.is_cancelled:        # 还没轮到就被取消
+                    self.signals.send_unit_result.emit(uid, "cancelled", "")
+                    continue
+                last_err = {"msg": ""}
+
+                def on_log(m, k="send", _e=last_err):
+                    if k == "error":
+                        _e["msg"] = m
+                    self.signals.log.emit(m, k)
+
+                def on_prog(fn, done, total, speed, _uid=uid):
+                    self.signals.send_unit_progress.emit(_uid, done, total, speed)
+
+                status = send_batch(sitems, ip, port, self.hostname, on_log,
+                                    on_progress=on_prog, ctrl=ctrl)
+                if status == "ok":
+                    self.signals.send_unit_result.emit(uid, "ok", "")
+                elif status == "cancelled":
+                    self.signals.send_unit_result.emit(uid, "cancelled", "")
+                else:
+                    self.signals.send_unit_result.emit(
+                        uid, "error", last_err["msg"] or "发送失败")
+        threading.Thread(target=worker, daemon=True).start()
+
+    # ---------- 发送队列回调 ----------
+    def _on_queue_pause(self, row):
+        meta = self._send_units.get(row.unit_id)
+        if not meta:
+            return
+        ctrl = meta["ctrl"]
+        if ctrl.is_paused:
+            ctrl.resume()
+            self.transfer_queue.set_paused(row.unit_id, False)
+        else:
+            ctrl.pause()
+            self.transfer_queue.set_paused(row.unit_id, True)
+
+    def _on_queue_cancel(self, row):
+        meta = self._send_units.get(row.unit_id)
+        if meta:
+            meta["ctrl"].cancel()
+
+    def _on_send_unit_progress(self, unit_id, done, total, speed):
+        self.transfer_queue.update_unit(unit_id, done, total, speed)
+
+    def _on_send_unit_result(self, unit_id, status, reason):
+        meta = self._send_units.pop(unit_id, None)
+        self.transfer_queue.remove_unit(unit_id)
+        if meta is None:
+            return
+        ip, label = meta["ip"], meta["label"]
+        if status == "ok":
+            rec = self._store_msg(ip, "batch",
+                                  json.dumps([meta["record"]], ensure_ascii=False),
+                                  True, self.hostname)
+        else:
+            reason_txt = "已取消" if status == "cancelled" else (reason or "发送失败")
+            rec = self._store_msg(ip, "notice",
+                                  f"📄 {label} 发送失败：{reason_txt}",
+                                  True, self.hostname)
+        if self.current_ip == ip:
+            self._add_bubble_widget(rec)
+            QTimer.singleShot(20, self._scroll_bottom)
+        self._peer_list_state = {}
+        self._rebuild_peer_list()
 
     def _safe_size(self, path):
         try:
@@ -6301,109 +6296,57 @@ class MainWindow(QMainWindow):
             self._refresh_header()  # 刷新在线状态颜色
 
     # ---------- 传输进度回调(主线程) ----------
-    def _on_send_progress(self, filename, done, total, speed):
-        pct = done / total if total > 0 else 0
-        FileCard.update_transfer(filename, pct, speed)
-        ClickableImage.update_transfer(filename, pct, speed)
-        # 横幅进度始终同步（暂停/取消按钮在横幅上）
-        if self.xfer_progress.isVisible():
-            self.xfer_progress.update_progress(done, total, speed)
-
     def _on_recv_progress(self, recv_id, filename, done, total, speed):
-        pct = done / total if total > 0 else 0
-        hit = RecvCard.update_progress(recv_id, pct, speed)
-        if not hit:
-            # 无占位卡片时用顶部横幅补充显示
-            fname = Path(filename).name if filename else "文件"
-            if not self.xfer_progress.isVisible():
-                self.xfer_progress.start_transfer("recv", fname)
-            self.xfer_progress.update_progress(done, total, speed)
-            if total > 0 and done >= total:
-                self.xfer_progress.finish()
+        # 统一: 接收进度只在顶部队列显示(无饼状)
+        if not self.transfer_queue.has(recv_id):
+            label = self._recv_meta.get(recv_id, {}).get("label") or (
+                Path(filename).name if filename else "文件")
+            self.transfer_queue.add_unit(recv_id, label, direction="recv",
+                                         controllable=False)
+        self.transfer_queue.update_unit(recv_id, done, total, speed)
 
-    def _on_send_done(self):
-        self._send_ctrl = None
-        FileCard.finish_all_transfers()
-        ClickableImage.finish_all_transfers()
-        self.xfer_progress.finish()
+    def _on_recv_done(self, recv_id):
+        # 收完: 移除顶部队列行(真正的气泡由 on_chat 在收完后插入)
+        self.transfer_queue.remove_unit(recv_id)
+        self._recv_meta.pop(recv_id, None)
 
-    def _on_send_cancelled(self, msg_id):
-        """发送方点了取消：撤回乐观气泡 + 删除本地记录，并立即收起进度横幅。"""
-        self._send_ctrl = None
-        # 停掉进度动画注册集合（气泡随后被删除，动画组件一并销毁）
-        FileCard._pending_transfer_names = set()
-        ClickableImage._pending_transfer_paths = set()
-        self.xfer_progress.cancel_ui()
-        # 撤回气泡组件
-        b = self._bubbles_by_id.pop(msg_id, None)
-        if b is not None:
-            b.deleteLater()
-        # 从历史 / 本次会话记录里删除这条消息
-        for store in (self.history, self.session):
-            for ip in list(store.keys()):
-                store[ip] = [m for m in store[ip] if m.get("msg_id") != msg_id]
-        self._save_history()
-        # 刷新左侧设备列表的预览/时间
+    def _on_recv_cancelled(self, recv_id):
+        """发送方取消/中断：移除队列行，并在聊天里给出接收失败说明。"""
+        self.transfer_queue.remove_unit(recv_id)
+        meta = self._recv_meta.pop(recv_id, None)
+        if not meta:
+            return
+        ip, label = meta.get("ip"), meta.get("label", "文件")
+        rec = self._store_msg(ip, "notice",
+                              f"📥 {label} 接收失败：发送方已取消或连接中断",
+                              False, self._peer_name(ip))
+        if self.current_ip == ip:
+            self._add_bubble_widget(rec)
+            QTimer.singleShot(20, self._scroll_bottom)
         self._peer_list_state = {}
         self._rebuild_peer_list()
 
-    def _on_recv_done(self, recv_id):
-        # 先从注册表移除，阻断后续进度信号访问已删除对象
-        RecvCard.remove(recv_id)
-        entry = self._recv_placeholders.pop(recv_id, None)
-        if entry:
-            _, frame = entry
-            if frame is not None:
-                frame.deleteLater()
-        self.xfer_progress.finish()
-
-    def _on_recv_cancelled(self, recv_id):
-        """发送方取消传输：移除接收占位符，不插入任何气泡。"""
-        RecvCard.remove(recv_id)
-        entry = self._recv_placeholders.pop(recv_id, None)
-        if entry:
-            _, frame = entry
-            if frame is not None:
-                frame.deleteLater()
-
     def _on_recv_started(self, recv_id, sender_name, sender_ip, meta_json):
-        """后台开始接收 → 在聊天里插入占位气泡，显示环形进度动画。"""
-        if self.current_ip != sender_ip:
-            # 不在当前对话，只记录 recv_id → sender_ip，不插入 UI
-            self._recv_placeholders[recv_id] = (sender_ip, None)
-            return
+        """后台开始接收 → 在顶部队列加一行进度(无饼状, 不插入聊天)。"""
         try:
             meta = json.loads(meta_json)
         except Exception:
-            return
-        if not meta:
-            return
-        frame = QFrame()
-        frame.setObjectName("placeholderBubble")
-        outer = QHBoxLayout(frame)
-        outer.setContentsMargins(12, 4, 60, 4)
-        outer.setSpacing(6)
-        inner = QVBoxLayout()
-        inner.setSpacing(4)
-        for item in meta:
-            card = RecvCard(recv_id, item.get("type", "file"),
-                            item.get("name", ""), item.get("size", 0))
-            inner.addWidget(card)
-        outer.addLayout(inner)
-        outer.addStretch()
-        self.chat_layout.insertWidget(self.chat_layout.count() - 1, frame)
-        self._recv_placeholders[recv_id] = (sender_ip, frame)
-        QTimer.singleShot(20, self._scroll_bottom)
-
-    def _on_msgs_delivered(self, ip, count):
-        """离线队列全部送达后，在聊天里插入一条送达提示分割线。"""
-        if self.current_ip == ip:
-            self._add_divider(f"✓ {count} 条离线消息已送达")
-            QTimer.singleShot(20, self._scroll_bottom)
+            meta = []
+        names = [m.get("name", "") for m in meta if m.get("name")]
+        if len(names) == 1:
+            label = names[0]
+        elif len(names) > 1:
+            label = f"{names[0]} 等 {len(names)} 个文件"
+        else:
+            label = "文件"
+        self._recv_meta[recv_id] = {"ip": sender_ip, "label": label}
+        self.transfer_queue.add_unit(recv_id, label, direction="recv",
+                                     controllable=False)
 
     # ---------- 离线队列 ----------
     def _flush_offline_queue(self, ip):
-        """对刚上线的 ip 发送队列里的消息（气泡已在发送时显示，此处只传输数据）。"""
+        """对刚上线的 ip 补发离线队列: 文字后台发送, 文件走统一的顶部队列
+        (传完出现气泡, 失败给说明), 与在线发送完全一致。"""
         queue = self.offline_queue.get(ip, [])
         if not queue:
             return
@@ -6416,23 +6359,18 @@ class MainWindow(QMainWindow):
         self._peer_list_state = {}
         self._rebuild_peer_list()
 
-        def do():
-            delivered = 0
-            for item in items_to_send:
-                send_items = item.get("send_items", [])
-                first_name = next((it.get("path", "") for it in send_items
-                                   if it.get("type") != "text"), "")
-                def on_prog(fn, done, total, speed):
-                    self.signals.send_progress.emit(fn, done, total, speed)
-                ok = send_batch(send_items, ip, port, self.hostname,
-                                lambda m, k="send": self.signals.log.emit(m, k),
-                                on_progress=on_prog, first_name=first_name)
-                self.signals.send_done.emit()
-                if ok == "ok":
-                    delivered += 1
-            if delivered:
-                self.signals.msgs_delivered.emit(ip, delivered)
-        threading.Thread(target=do, daemon=True).start()
+        for entry in items_to_send:
+            if "file_units" in entry or "text_items" in entry:
+                self._send_text_unit(ip, port, entry.get("text_items") or [])
+                self._start_file_units(ip, port, entry.get("file_units") or [])
+            else:
+                # 兼容旧格式(整批一次性发送)
+                send_items = entry.get("send_items", [])
+
+                def do(_items=send_items):
+                    send_batch(_items, ip, port, self.hostname,
+                               lambda m, k="send": self.signals.log.emit(m, k))
+                threading.Thread(target=do, daemon=True).start()
 
     # ---------- 待确认接收 ----------
     def _update_staged_banner(self):
