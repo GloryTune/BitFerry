@@ -1242,6 +1242,67 @@ class _GlobalHotkey(QAbstractNativeEventFilter):
         return False, 0
 
 
+def _parse_mac_shortcut(seq_str):
+    """'Alt+Shift+A' -> (修饰键标志位, 主键字符小写)。"""
+    SHIFT, CTRL, OPT, CMD = 0x20000, 0x40000, 0x80000, 0x100000
+    mods, key = 0, ""
+    for tok in (seq_str or "").replace(" ", "").split("+"):
+        t = tok.lower()
+        if t == "shift":
+            mods |= SHIFT
+        elif t in ("ctrl", "control"):
+            mods |= CTRL
+        elif t in ("alt", "option", "opt"):
+            mods |= OPT
+        elif t in ("cmd", "command", "meta"):
+            mods |= CMD
+        elif tok:
+            key = tok.lower()
+    return mods, key
+
+
+class _MacGlobalHotkey:
+    """macOS 全局热键: 不聚焦 BitFerry 也能触发截图。
+    用 NSEvent 全局监听(需"辅助功能"权限)。仅在 App 未聚焦时触发,
+    聚焦时由应用内 QShortcut 处理, 两者互不重复。"""
+    MOD_MASK = 0x20000 | 0x40000 | 0x80000 | 0x100000  # shift/ctrl/option/command
+
+    def __init__(self, callback):
+        self._callback = callback
+        self._monitor = None
+
+    def register(self, seq_str) -> bool:
+        self.unregister()
+        mods, key = _parse_mac_shortcut(seq_str)
+        if not key:
+            return False
+        try:
+            from AppKit import NSEvent
+            NSEventMaskKeyDown = 1 << 10
+
+            def handler(event):
+                try:
+                    if (int(event.modifierFlags()) & self.MOD_MASK) == mods and \
+                       (event.charactersIgnoringModifiers() or "").lower() == key:
+                        self._callback()
+                except Exception:
+                    pass
+            self._monitor = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+                NSEventMaskKeyDown, handler)
+            return self._monitor is not None
+        except Exception:
+            return False
+
+    def unregister(self):
+        if self._monitor is not None:
+            try:
+                from AppKit import NSEvent
+                NSEvent.removeMonitor_(self._monitor)
+            except Exception:
+                pass
+            self._monitor = None
+
+
 class _TextInput(QLineEdit):
     committed = pyqtSignal(str)
     cancelled = pyqtSignal()
@@ -2927,7 +2988,8 @@ class Receiver:
                     out_parts.append({"type": "file", "name": filename,
                                       "size": size, "path": str(dest),
                                       "staged": confirm,
-                                      "final_dir": final_dir})
+                                      "final_dir": final_dir,
+                                      "relpath": part.get("relpath")})
                     if not confirm:
                         pending_on_file.append(str(dest))
 
@@ -2954,8 +3016,37 @@ class Receiver:
         self.on_log(f"收到一批消息 · 来自 {sender} · {len(parts)} 项", "recv")
         if self.on_recv_done and total_binary > 0:
             self.on_recv_done(recv_id)
-        kind = "batch_staged" if confirm else "batch"
-        self.on_chat(sender, sender_ip, kind, json.dumps(out_parts, ensure_ascii=False))
+        # 文字/图片永远自动接收; 仅文件在"手动确认"模式下需要确认
+        auto_parts = [p for p in out_parts if p.get("type") in ("text", "image")]
+        raw_files = [p for p in out_parts if p.get("type") == "file"]
+        # 把同一文件夹(带 relpath)的文件合并成一个文件夹卡片, 接收方看到的是文件夹
+        dest_base = (TEMP_RECV_DIR if confirm else globals()["RECV_ROOT"]) / folder
+        groups, loose = {}, []
+        for fp in raw_files:
+            rel = fp.get("relpath")
+            top = str(rel).replace("\\", "/").split("/")[0] if rel else None
+            if top:
+                groups.setdefault(top, []).append(fp)
+            else:
+                loose.append(fp)
+        file_parts = []
+        for top, members in groups.items():
+            file_parts.append({
+                "type": "file", "is_folder": True,
+                "name": f"{top}/（{len(members)} 个文件）",
+                "size": sum(m.get("size", 0) for m in members),
+                "path": str(dest_base / top),
+                "staged": confirm,
+                "final_dir": str(globals()["RECV_ROOT"] / folder) if confirm else "",
+            })
+        file_parts.extend(loose)
+        if auto_parts:
+            self.on_chat(sender, sender_ip, "batch",
+                         json.dumps(auto_parts, ensure_ascii=False))
+        if file_parts:
+            self.on_chat(sender, sender_ip,
+                         "batch_staged" if confirm else "batch",
+                         json.dumps(file_parts, ensure_ascii=False))
 
     def _recv_n_progress(self, conn, n, recv_id, fname, base_done, total, t_start):
         """接收 n 字节(小数据/标记用), 同时上报进度。连接关闭或超时则抛出 _TransferAborted。"""
@@ -3329,7 +3420,17 @@ class ClickableImage(QLabel):
             self.setFocus()
 
     def mouseDoubleClickEvent(self, e):
+        # 双击聊天里的图片: 打开应用内编辑器标注/裁剪; 点"完成"后结果进剪贴板待粘贴
         if e.button() == Qt.MouseButton.LeftButton and not self._transferring:
+            if self.path and os.path.exists(self.path):
+                dlg = ImageEditorDialog(self.window(), self.path)
+                if dlg.exec() and dlg.result_path:
+                    pix = QPixmap(dlg.result_path)
+                    if not pix.isNull():
+                        QApplication.clipboard().setPixmap(pix)
+                        from PyQt6.QtWidgets import QToolTip
+                        QToolTip.showText(QCursor.pos(), "已复制到剪贴板，可粘贴")
+                return
             _open_path(self.path)
 
     def keyPressEvent(self, e):
@@ -4068,8 +4169,12 @@ class SettingsDialog(QDialog):
 
         t = THEMES.get(_load_theme_name(), THEMES["midnight"])
         rc = t["t1"]
+        rv_hint = QLabel("仅对文件生效；文字消息和截图始终自动接收。")
+        rv_hint.setStyleSheet(f"color:{t['t4']}; font-size:11px;")
+        rv_hint.setWordWrap(True)
+        rv_lay.addWidget(rv_hint)
         self.radio_auto = QRadioButton("自动接收（无需确认，直接保存到接收目录）")
-        self.radio_confirm = QRadioButton('手动确认接收（需要点击"接收"按钮才保存文件）')
+        self.radio_confirm = QRadioButton('手动确认接收（发来文件时可选择接收哪些）')
         self.radio_auto.setStyleSheet(f"color:{rc}; font-size:12px;")
         self.radio_confirm.setStyleSheet(f"color:{rc}; font-size:12px;")
         grp = QButtonGroup(self)
@@ -4391,6 +4496,46 @@ class TransferQueueWidget(QFrame):
             self.hide()
 
 
+class StagedSelectDialog(QDialog):
+    """手动接收: 勾选要接收发送方发来的哪几个文件。"""
+    def __init__(self, files, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("选择要接收的文件")
+        self.setMinimumWidth(360)
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("勾选要接收的文件，未勾选的将被拒绝："))
+        self._checks = []   # (QCheckBox, path)
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        holder = QWidget()
+        hl = QVBoxLayout(holder)
+        hl.setSpacing(4)
+        for f in files:
+            cb = QCheckBox(f"{f.get('name', '文件')}  ({human_size(f.get('size', 0))})")
+            cb.setChecked(True)
+            hl.addWidget(cb)
+            self._checks.append((cb, f.get("path")))
+        hl.addStretch()
+        area.setWidget(holder)
+        area.setFixedHeight(min(260, 44 + 26 * max(1, len(files))))
+        lay.addWidget(area)
+        btns = QHBoxLayout()
+        btns.addStretch()
+        ok = QPushButton("接收所选")
+        ok.setObjectName("acceptBtn")
+        ok.setCursor(Qt.CursorShape.PointingHandCursor)
+        ok.clicked.connect(self.accept)
+        cancel = QPushButton("取消")
+        cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        cancel.clicked.connect(self.reject)
+        btns.addWidget(ok)
+        btns.addWidget(cancel)
+        lay.addLayout(btns)
+
+    def selected_paths(self):
+        return {p for cb, p in self._checks if cb.isChecked()}
+
+
 # ----------------------------- 网段设置弹窗 -----------------------------
 class NetworkDialog(QDialog):
     """让用户手动添加/删除广播网段，解决跨子网或 VPN 场景下发现不到设备的问题。"""
@@ -4618,6 +4763,10 @@ class ChatInput(QTextEdit):
         self._img_map = {}
 
     def keyPressEvent(self, e):
+        # Ctrl/Cmd+V: 自己处理粘贴, 保证图片/文件能稳健粘贴(与"粘贴"按钮一致)
+        if e.matches(QKeySequence.StandardKey.Paste):
+            self._paste_from_clipboard()
+            return
         if e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             if e.modifiers() & Qt.KeyboardModifier.ShiftModifier:
                 super().keyPressEvent(e)
@@ -4626,6 +4775,26 @@ class ChatInput(QTextEdit):
                 return
         else:
             super().keyPressEvent(e)
+
+    def _paste_from_clipboard(self):
+        """统一粘贴入口(快捷键/右键都走这里): 文件URL → 附件; 图片 → 内嵌; 否则文本。"""
+        cb = QApplication.clipboard()
+        md = cb.mimeData() if cb is not None else None
+        if md is None:
+            return
+        paths = _extract_paths(md)
+        if paths:
+            self.pathsAttached.emit(paths)
+            return
+        if md.hasImage():
+            img = cb.image()          # 比 md.imageData() 更稳健
+            if img is not None and not img.isNull():
+                p = _save_qimage(img)
+                if p:
+                    self.imageAttached.emit(p)
+                return
+        if md.hasText():
+            self.insertPlainText(md.text())
 
     def add_inline_image(self, path, at_end=False):
         """把一张图片以缩略图形式插入到输入框光标处。at_end=True 时插到末尾。"""
@@ -4779,6 +4948,10 @@ class ChatInput(QTextEdit):
             return
         if source.hasImage():
             img = source.imageData()
+            if not (isinstance(img, QImage) and not img.isNull()):
+                # 某些来源 imageData() 取不到, 回退到剪贴板 image()
+                cb = QApplication.clipboard()
+                img = cb.image() if cb is not None else None
             if isinstance(img, QImage) and not img.isNull():
                 p = _save_qimage(img)
                 if p:
@@ -4948,6 +5121,7 @@ class MainWindow(QMainWindow):
         self._build_tray()
         self._shot_shortcut = None
         self._global_hotkey = None
+        self._mac_hotkey = None
         self._install_shortcut(load_shortcut())
 
         self.discovery = Discovery(
@@ -5339,22 +5513,13 @@ class MainWindow(QMainWindow):
         brand_row.addStretch()
         sb.addLayout(brand_row)
         sb.addWidget(self._lbl("内网快传", "brandSub"))
-        # 全局按钮行: 设置 / 目录(任何时候都显示, 不依赖是否选中设备)
-        gact = QHBoxLayout()
-        gact.setSpacing(8)
+        # 全局设置按钮(接收目录的打开功能在下方接收目录卡片里, 这里不重复)
         self.btn_settings = QPushButton("⚙ 设置")
         self.btn_settings.setObjectName("miniBtn")
         self.btn_settings.setToolTip("快捷键 · 接收行为 · 窗口设置")
         self.btn_settings.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_settings.clicked.connect(self.action_settings)
-        self.btn_open = QPushButton("📂 接收目录")
-        self.btn_open.setObjectName("miniBtn")
-        self.btn_open.setToolTip("打开接收目录")
-        self.btn_open.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_open.clicked.connect(self.action_open_recv)
-        gact.addWidget(self.btn_settings, 1)
-        gact.addWidget(self.btn_open, 1)
-        sb.addLayout(gact)
+        sb.addWidget(self.btn_settings)
 
         selfCard = QFrame()
         selfCard.setObjectName("selfCard")
@@ -5484,6 +5649,11 @@ class MainWindow(QMainWindow):
         self.recv_pending_lbl = QLabel("")
         self.recv_pending_lbl.setObjectName("recvPendingText")
         rpl.addWidget(self.recv_pending_lbl, 1)
+        btn_select = QPushButton("选择接收")
+        btn_select.setObjectName("acceptBtn")
+        btn_select.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_select.setToolTip("勾选要接收的文件")
+        btn_select.clicked.connect(self._select_staged)
         btn_accept_all = QPushButton("全部接收")
         btn_accept_all.setObjectName("acceptBtn")
         btn_accept_all.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -5492,6 +5662,7 @@ class MainWindow(QMainWindow):
         btn_reject_all.setObjectName("rejectBtn")
         btn_reject_all.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_reject_all.clicked.connect(self._reject_all_staged)
+        rpl.addWidget(btn_select)
         rpl.addWidget(btn_accept_all)
         rpl.addWidget(btn_reject_all)
         self.recv_pending_banner.hide()
@@ -6257,6 +6428,8 @@ class MainWindow(QMainWindow):
         if not seq_str:
             if getattr(self, "_global_hotkey", None) is not None:
                 self._global_hotkey.unregister()
+            if getattr(self, "_mac_hotkey", None) is not None:
+                self._mac_hotkey.unregister()
             return
         # Windows: 优先注册全局热键(不聚焦 BitFerry 也能触发截图)
         if platform.system() == "Windows":
@@ -6269,7 +6442,17 @@ class MainWindow(QMainWindow):
                     return            # 全局热键已生效, 不再装应用内快捷键(避免双触发)
             except Exception:
                 pass
-        # 回退 / 非 Windows: 应用内快捷键(窗口聚焦时生效)
+        # macOS: 注册全局热键(未聚焦也能触发, 需"辅助功能"权限);
+        # 仍保留下面的应用内快捷键处理聚焦时的情况, 两者不会重复触发。
+        if platform.system() == "Darwin":
+            try:
+                if self._mac_hotkey is None:
+                    self._mac_hotkey = _MacGlobalHotkey(
+                        lambda: QTimer.singleShot(0, self.action_screenshot))
+                self._mac_hotkey.register(seq_str)
+            except Exception:
+                pass
+        # 回退 / 应用内快捷键(窗口聚焦时生效)
         try:
             sc = QShortcut(QKeySequence(seq_str), self)
             sc.setContext(Qt.ShortcutContext.ApplicationShortcut)
@@ -6398,15 +6581,24 @@ class MainWindow(QMainWindow):
         self.recv_pending_lbl.setText(f"📥 {sender} 发来 {desc}，等待接收确认")
         self.recv_pending_banner.show()
 
-    def _accept_all_staged(self):
-        ip = self.current_ip
-        if not ip:
-            return
-        staged = self.staged_receives.pop(ip, [])
-        for item in staged:
-            final_parts = []
+    def _staged_files(self, ip):
+        """当前 ip 所有待确认的文件部件(扁平列表)。"""
+        out = []
+        for item in self.staged_receives.get(ip, []):
             for part in item["parts"]:
                 if part.get("type") == "file" and part.get("staged"):
+                    out.append((item["name"], part))
+        return out
+
+    def _resolve_staged(self, ip, accept_paths):
+        """接收 accept_paths 里的文件(移到最终目录并入聊天), 其余删除/拒绝。"""
+        staged = self.staged_receives.pop(ip, [])
+        n_ok = n_no = 0
+        for item in staged:
+            for part in item["parts"]:
+                if not (part.get("type") == "file" and part.get("staged")):
+                    continue
+                if part.get("path") in accept_paths:
                     src = Path(part["path"])
                     dest_dir = Path(part.get("final_dir", str(globals()["RECV_ROOT"])))
                     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -6416,39 +6608,61 @@ class MainWindow(QMainWindow):
                     while dest.exists():
                         dest = dest_dir / f"{b}_{i}{e}"
                         i += 1
+                    fp = dict(part)
                     try:
                         import shutil
                         shutil.move(str(src), str(dest))
-                        part = dict(part)
-                        part["path"] = str(dest)
-                        part["staged"] = False
+                        fp["path"] = str(dest)
+                        fp["staged"] = False
                     except Exception:
                         pass
-                final_parts.append(part)
-            rec = self._store_msg(ip, "batch", json.dumps(final_parts, ensure_ascii=False),
-                                  False, item["name"])
-            if self.current_ip == ip:
-                self._add_bubble_widget(rec)
-        if self.current_ip == ip:
+                    rec = self._store_msg(ip, "batch",
+                                          json.dumps([fp], ensure_ascii=False),
+                                          False, item["name"])
+                    if self.current_ip == ip:
+                        self._add_bubble_widget(rec)
+                    n_ok += 1
+                else:
+                    try:
+                        p = Path(part["path"])
+                        if p.is_dir():
+                            import shutil
+                            shutil.rmtree(p, ignore_errors=True)
+                        else:
+                            p.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    n_no += 1
+        if self.current_ip == ip and n_ok:
             QTimer.singleShot(20, self._scroll_bottom)
         self._update_staged_banner()
-        self.recv_pending_banner.hide()
-        self._append_log(f"已接收来自 {ip} 的 {len(staged)} 批文件", "recv")
+        if n_ok or n_no:
+            self._append_log(
+                f"来自 {ip}: 接收 {n_ok} 个文件" + (f", 拒绝 {n_no} 个" if n_no else ""),
+                "recv")
+
+    def _select_staged(self):
+        ip = self.current_ip
+        if not ip:
+            return
+        files = self._staged_files(ip)
+        if not files:
+            return
+        dlg = StagedSelectDialog([p for _, p in files], self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._resolve_staged(ip, dlg.selected_paths())
+
+    def _accept_all_staged(self):
+        ip = self.current_ip
+        if not ip:
+            return
+        self._resolve_staged(ip, {p.get("path") for _, p in self._staged_files(ip)})
 
     def _reject_all_staged(self):
         ip = self.current_ip
         if not ip:
             return
-        staged = self.staged_receives.pop(ip, [])
-        for item in staged:
-            for part in item["parts"]:
-                if part.get("type") in ("file", "image") and part.get("staged", True):
-                    try:
-                        Path(part["path"]).unlink(missing_ok=True)
-                    except Exception:
-                        pass
-        self.recv_pending_banner.hide()
-        self._append_log(f"已拒绝来自 {ip} 的文件", "info")
+        self._resolve_staged(ip, set())
 
     def action_screenshot(self):
         """区域截图 -> 内嵌到输入框。
@@ -6696,6 +6910,8 @@ class MainWindow(QMainWindow):
         self._save_devices()
         if getattr(self, "_global_hotkey", None) is not None:
             self._global_hotkey.unregister()
+        if getattr(self, "_mac_hotkey", None) is not None:
+            self._mac_hotkey.unregister()
         if getattr(self, "tray", None) is not None:
             self.tray.hide()
         event.accept()
