@@ -38,7 +38,7 @@ exe = EXE(
     a.binaries,
     a.zipfiles,
     a.datas,
-    name='BitFerry',
+    name='BitFerry-windows-x64',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

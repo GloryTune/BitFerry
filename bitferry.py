@@ -53,10 +53,13 @@ TRANSFER_PORT = 50809
 
 # ---------- 版本 / 在线更新 ----------
 # 发版时同步修改此处与 bitferry.spec 里的 CFBundleShortVersionString。
-__version__ = "1.1.2"
+__version__ = "1.1.3"
 GITHUB_REPO = "GloryTune/BitFerry"
-GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases/latest"
+# 检查更新走仓库里的 version.json(经 raw CDN, 不受 api.github.com 60次/小时限流);
+# VPN 共用出口 IP 时尤其重要。下载仍走 releases 资产直链。
+GITHUB_VERSION_JSON = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/version.json"
+GITHUB_DL_BASE = f"https://github.com/{GITHUB_REPO}/releases/download"
 BROADCAST_INTERVAL = 2.0
 PEER_TIMEOUT = 6.0
 MAGIC = b"LTNG"
@@ -6957,19 +6960,6 @@ def _is_newer(remote: str, local: str) -> bool:
     return _parse_version(remote) > _parse_version(local)
 
 
-def _update_asset_match(name: str) -> bool:
-    """当前平台对应的发布资产文件名匹配规则。"""
-    name = (name or "").lower()
-    sysname = platform.system()
-    if sysname == "Darwin":
-        return name.endswith(".zip") and "mac" in name
-    if sysname == "Windows":
-        # release 里 Windows 资产就一个 exe, 名字叫 BitFerry.exe 或
-        # BitFerry-windows-x64.exe 都能认, 省去每次上传改名。
-        return name.endswith(".exe")
-    return False
-
-
 def _plain_notes(text: str) -> str:
     """把 release 说明里的 markdown 标记清成干净纯文本(弹窗不渲染 markdown)。"""
     out = []
@@ -7003,32 +6993,34 @@ def _ssl_context():
 
 
 def fetch_latest_release(timeout=10):
-    """请求 GitHub 最新 release，返回解析后的 dict，失败抛异常。"""
+    """读取仓库 version.json(经 raw CDN, 不受 GitHub API 限流), 返回更新信息。
+
+    version.json 形如:
+      {"version":"1.1.3","notes":"...","assets":{"darwin":"BitFerry-macos-arm64.zip",
+       "windows":"BitFerry-windows-x64.exe"}}
+    下载直链由 release 资产地址拼出: .../releases/download/v<version>/<asset>。
+    """
     import urllib.request
     req = urllib.request.Request(
-        GITHUB_API_LATEST,
-        headers={
-            "Accept": "application/vnd.github+json",
-            "User-Agent": f"BitFerry/{__version__}",
-        },
-    )
+        GITHUB_VERSION_JSON,
+        headers={"User-Agent": f"BitFerry/{__version__}",
+                 "Cache-Control": "no-cache"})
     with urllib.request.urlopen(req, timeout=timeout, context=_ssl_context()) as resp:
         data = json.loads(resp.read().decode("utf-8"))
-    tag = data.get("tag_name", "") or ""
+    version = (data.get("version", "") or "").lstrip("vV")
+    assets = data.get("assets", {}) or {}
+    sysname = platform.system()
+    key = "darwin" if sysname == "Darwin" else ("windows" if sysname == "Windows" else "")
+    name = assets.get(key)
     asset = None
-    for a in data.get("assets", []) or []:
-        if _update_asset_match(a.get("name", "")):
-            asset = {
-                "name": a.get("name"),
-                "url": a.get("browser_download_url"),
-                "size": a.get("size", 0) or 0,
-            }
-            break
+    if name and version:
+        asset = {"name": name, "size": 0,
+                 "url": f"{GITHUB_DL_BASE}/v{version}/{name}"}
     return {
-        "version": tag.lstrip("vV"),
-        "tag": tag,
-        "notes": data.get("body", "") or "",
-        "page": data.get("html_url", GITHUB_RELEASES_PAGE),
+        "version": version,
+        "tag": f"v{version}" if version else "",
+        "notes": data.get("notes", "") or "",
+        "page": GITHUB_RELEASES_PAGE,
         "asset": asset,
     }
 
