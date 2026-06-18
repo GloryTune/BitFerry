@@ -14,6 +14,8 @@ a = Analysis(
         'PyQt6.QtGui',
         'PyQt6.QtWidgets',
         'PyQt6.sip',
+        # 在线更新 HTTPS 校验用的 CA 证书库
+        'certifi',
     ],
     hookspath=[],
     hooksconfig={},

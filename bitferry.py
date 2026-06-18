@@ -53,7 +53,7 @@ TRANSFER_PORT = 50809
 
 # ---------- 版本 / 在线更新 ----------
 # 发版时同步修改此处与 bitferry.spec 里的 CFBundleShortVersionString。
-__version__ = "1.1.1"
+__version__ = "1.1.2"
 GITHUB_REPO = "GloryTune/BitFerry"
 GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases/latest"
@@ -6987,6 +6987,21 @@ def _plain_notes(text: str) -> str:
     return cleaned
 
 
+def _ssl_context():
+    """打包后的 Python 没有系统 CA 证书库, HTTPS 校验会因找不到根证书而失败。
+    用 certifi 自带的 CA 包构建 SSL 上下文; 没有 certifi 时退回默认。"""
+    try:
+        import ssl
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        try:
+            import ssl
+            return ssl.create_default_context()
+        except Exception:
+            return None
+
+
 def fetch_latest_release(timeout=10):
     """请求 GitHub 最新 release，返回解析后的 dict，失败抛异常。"""
     import urllib.request
@@ -6997,7 +7012,7 @@ def fetch_latest_release(timeout=10):
             "User-Agent": f"BitFerry/{__version__}",
         },
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with urllib.request.urlopen(req, timeout=timeout, context=_ssl_context()) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     tag = data.get("tag_name", "") or ""
     asset = None
@@ -7050,7 +7065,8 @@ def _download_with_progress(url, dest_path, expected_size,
     import urllib.request
     req = urllib.request.Request(
         url, headers={"User-Agent": f"BitFerry/{__version__}"})
-    with urllib.request.urlopen(req, timeout=30) as resp, open(dest_path, "wb") as f:
+    with urllib.request.urlopen(req, timeout=30, context=_ssl_context()) as resp, \
+            open(dest_path, "wb") as f:
         total = expected_size or int(resp.headers.get("Content-Length", 0) or 0)
         downloaded = 0
         while True:
