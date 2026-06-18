@@ -53,7 +53,7 @@ TRANSFER_PORT = 50809
 
 # ---------- 版本 / 在线更新 ----------
 # 发版时同步修改此处与 bitferry.spec 里的 CFBundleShortVersionString。
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 GITHUB_REPO = "GloryTune/BitFerry"
 GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases/latest"
@@ -4123,6 +4123,13 @@ class SettingsDialog(QDialog):
         self._original_theme = _load_theme_name()   # 取消时回滚用
         self._selected_theme = self._original_theme
         self._swatches: dict = {}
+        # 取消时回滚窗口尺寸用: 记录打开设置前主窗口的实际大小
+        self._original_size = None
+        if parent is not None:
+            try:
+                self._original_size = (parent.width(), parent.height())
+            except Exception:
+                self._original_size = None
         self._build()
 
     def _build(self):
@@ -4324,14 +4331,31 @@ class SettingsDialog(QDialog):
         self._apply_preview(name)
 
     def reject(self):
-        """取消时回滚到打开前的主题。"""
+        """取消时回滚到打开前的主题和窗口尺寸。"""
         if self._selected_theme != self._original_theme:
             self._apply_preview(self._original_theme)
+        # 若预览过尺寸, 还原回打开设置前的大小
+        if self._size_explicit and self._original_size is not None:
+            self._apply_size(*self._original_size)
         super().reject()
+
+    def _apply_size(self, w, h):
+        """立即把主窗口调成指定尺寸, 让用户实时看到效果(与主题预览一致)。"""
+        win = self.parent()
+        if win is None:
+            return
+        try:
+            if win.isMaximized():
+                win.showNormal()
+            win.resize(w, h)
+        except Exception:
+            pass
 
     def _pick_size(self, w, h):
         self._win_size_choice = (w, h)
         self._size_explicit = True
+        # 点击即时预览: 主窗口跟着变到该尺寸
+        self._apply_size(w, h)
 
     def _save_and_accept(self):
         seq = self.shortcut_cap.sequence()
@@ -4344,18 +4368,11 @@ class SettingsDialog(QDialog):
         set_setting("close_to_tray", self.chk_close_tray.isChecked())
         if self.chk_autostart is not None:
             set_autostart(self.chk_autostart.isChecked())
-        # 仅当用户这次明确点了某个预设时, 才立即把窗口调成该尺寸
+        # 仅当用户这次明确点了某个预设时, 才持久化尺寸(预览时窗口已是该尺寸)
         if self._size_explicit:
             w, h = self._win_size_choice
             set_setting("window_size", [w, h])
-            win = self.parent()
-            if win is not None:
-                try:
-                    if win.isMaximized():
-                        win.showNormal()
-                    win.resize(w, h)
-                except Exception:
-                    pass
+            self._apply_size(w, h)
         set_setting("theme", self._selected_theme)
         self.accept()
 
