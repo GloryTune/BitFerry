@@ -50,6 +50,13 @@ ICON_B64 = "iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAYAAABccqhmAAABIGlDQ1BzUkdCAAAYlWNg
 # ----------------------------- 配置 -----------------------------
 DISCOVERY_PORT = 50808
 TRANSFER_PORT = 50809
+
+# ---------- 版本 / 在线更新 ----------
+# 发版时同步修改此处与 bitferry.spec 里的 CFBundleShortVersionString。
+__version__ = "1.0.1"
+GITHUB_REPO = "GloryTune/BitFerry"
+GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases/latest"
 BROADCAST_INTERVAL = 2.0
 PEER_TIMEOUT = 6.0
 MAGIC = b"LTNG"
@@ -5054,6 +5061,9 @@ class MainWindow(QMainWindow):
 
         self._rebuild_peer_list()
 
+        # 启动后静默检查更新（延迟，避免拖慢启动）
+        QTimer.singleShot(3000, lambda: self.action_check_update(manual=False))
+
     # ---------- 系统托盘 ----------
     def _make_icon(self):
         try:
@@ -5095,6 +5105,8 @@ class MainWindow(QMainWindow):
             act_recv.triggered.connect(self.action_open_recv)
             act_setting = QAction("设置", self)
             act_setting.triggered.connect(self._tray_open_settings)
+            act_update = QAction("检查更新", self)
+            act_update.triggered.connect(lambda: self.action_check_update(manual=True))
             act_quit = QAction("退出", self)
             act_quit.triggered.connect(self._tray_quit)
             menu.addAction(act_show)
@@ -5102,6 +5114,7 @@ class MainWindow(QMainWindow):
             menu.addAction(act_shot)
             menu.addAction(act_recv)
             menu.addAction(act_setting)
+            menu.addAction(act_update)
             menu.addSeparator()
             menu.addAction(act_quit)
             self.tray.setContextMenu(menu)
@@ -5114,6 +5127,128 @@ class MainWindow(QMainWindow):
         if reason in (QSystemTrayIcon.ActivationReason.Trigger,
                       QSystemTrayIcon.ActivationReason.DoubleClick):
             self._restore_window()
+
+    # ---------- 在线更新 ----------
+    def action_check_update(self, manual=False):
+        """检查更新。manual=True 时会在"已最新/失败"也给出提示。"""
+        self._update_manual = manual
+        if getattr(self, "_update_checking", False):
+            return
+        self._update_checking = True
+        sig = UpdateSignals()
+        self._update_sig = sig            # 持有引用，避免被回收
+        sig.available.connect(self._on_update_available)
+        sig.uptodate.connect(self._on_update_uptodate)
+        sig.failed.connect(self._on_update_failed)
+        for s in (sig.available, sig.uptodate, sig.failed):
+            s.connect(lambda *_: setattr(self, "_update_checking", False))
+        check_for_update_async(sig)
+
+    def _on_update_uptodate(self):
+        if getattr(self, "_update_manual", False):
+            QMessageBox.information(
+                self, "检查更新", f"当前已是最新版本 {__version__}。")
+
+    def _on_update_failed(self, msg):
+        if getattr(self, "_update_manual", False):
+            QMessageBox.warning(self, "检查更新", f"检查更新失败：\n{msg}")
+
+    def _on_update_available(self, rel):
+        # 记下待更新版本并在标题区亮出箭头徽标(不打扰)
+        self._pending_update = rel
+        if getattr(self, "btn_update_badge", None) is not None:
+            self.btn_update_badge.setToolTip(
+                f"发现新版本 {rel['version']}，点击查看")
+            self.btn_update_badge.show()
+        # 仅当用户手动点了"检查更新"时, 才立刻弹出详情
+        if getattr(self, "_update_manual", False):
+            self._show_update_dialog(rel)
+
+    def _open_pending_update(self):
+        rel = getattr(self, "_pending_update", None)
+        if rel:
+            self._show_update_dialog(rel)
+
+    def _show_update_dialog(self, rel):
+        box = QMessageBox(self)
+        box.setWindowTitle("发现新版本")
+        box.setText(f"发现新版本 {rel['version']}（当前 {__version__}）")
+        box.setInformativeText(
+            (_plain_notes(rel.get("notes")) or "无更新说明")[:1200])
+        ok = box.addButton("立即更新", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("以后再说", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is ok:
+            self._start_update_download(rel)
+
+    def _start_update_download(self, rel):
+        import webbrowser
+        asset = rel.get("asset")
+        # 没有当前平台的资产，或源码运行（无法自替换）：打开发布页让用户手动下载
+        if not asset or not asset.get("url") or not getattr(sys, "frozen", False):
+            webbrowser.open(rel.get("page") or GITHUB_RELEASES_PAGE)
+            if not getattr(sys, "frozen", False):
+                QMessageBox.information(
+                    self, "更新",
+                    "当前为源码运行，已打开发布页，请手动下载新版本。")
+            return
+
+        from PyQt6.QtWidgets import QProgressDialog
+        tmpdir = Path(tempfile.mkdtemp(prefix="bitferry_dl_"))
+        dest = tmpdir / asset["name"]
+        total = asset.get("size", 0)
+
+        dlg = QProgressDialog("正在下载更新…", "取消", 0, max(total, 1), self)
+        dlg.setWindowTitle("下载更新")
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+        dlg.setMinimumDuration(0)
+        dlg.setValue(0)
+
+        sig = _DLSignals()
+        self._dl_sig = sig
+        state = {"cancel": False}
+        dlg.canceled.connect(lambda: state.update(cancel=True))
+
+        def _progress(done, tot):
+            if tot:
+                dlg.setMaximum(tot)
+                dlg.setValue(done)
+            else:
+                dlg.setRange(0, 0)
+        sig.progress.connect(_progress)
+
+        def _done():
+            dlg.close()
+            try:
+                if platform.system() == "Darwin":
+                    apply_update_macos(dest)
+                else:
+                    apply_update_windows(dest)
+            except Exception as e:
+                QMessageBox.warning(self, "更新失败", f"安装更新时出错：\n{e}")
+                return
+            self._force_quit = True
+            QApplication.quit()
+        sig.finished.connect(_done)
+
+        def _failed(msg):
+            dlg.close()
+            QMessageBox.warning(self, "下载失败", f"下载更新失败：\n{msg}")
+        sig.failed.connect(_failed)
+
+        def worker():
+            try:
+                ok = _download_with_progress(
+                    asset["url"], dest, total,
+                    progress_cb=lambda d, t: sig.progress.emit(d, t),
+                    cancel_cb=lambda: state["cancel"])
+                if ok:
+                    sig.finished.emit()
+            except Exception as e:
+                sig.failed.emit(str(e))
+        threading.Thread(target=worker, daemon=True).start()
+        dlg.exec()
 
     def _tray_open_settings(self):
         # 从托盘打开设置: 先把窗口带到前台, 设置对话框才不会落在后面
@@ -5277,7 +5412,25 @@ class MainWindow(QMainWindow):
         sb.setContentsMargins(20, 22, 20, 18)
         sb.setSpacing(12)
 
-        sb.addWidget(self._lbl("BitFerry", "brand"))
+        brand_row = QHBoxLayout()
+        brand_row.setContentsMargins(0, 0, 0, 0)
+        brand_row.setSpacing(6)
+        brand_row.addWidget(self._lbl("BitFerry", "brand"))
+        # 有更新时才出现的箭头徽标, 点击查看更新内容
+        self.btn_update_badge = QToolButton()
+        self.btn_update_badge.setText("⬆ 更新")
+        self.btn_update_badge.setObjectName("updateBadge")
+        self.btn_update_badge.setToolTip("发现新版本，点击查看")
+        self.btn_update_badge.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_update_badge.setStyleSheet(
+            "QToolButton#updateBadge{background:#2ecc71;color:white;border:none;"
+            "border-radius:9px;font-size:11px;font-weight:bold;padding:1px 8px;}"
+            "QToolButton#updateBadge:hover{background:#27ae60;}")
+        self.btn_update_badge.clicked.connect(self._open_pending_update)
+        self.btn_update_badge.hide()
+        brand_row.addWidget(self.btn_update_badge)
+        brand_row.addStretch()
+        sb.addLayout(brand_row)
         sb.addWidget(self._lbl("内网快传", "brandSub"))
         # 全局按钮行: 设置 / 目录(任何时候都显示, 不依赖是否选中设备)
         gact = QHBoxLayout()
@@ -6608,6 +6761,215 @@ class MainWindow(QMainWindow):
         if getattr(self, "tray", None) is not None:
             self.tray.hide()
         event.accept()
+
+
+# ============================================================
+#  在线更新 (GitHub Releases)
+# ============================================================
+
+def _parse_version(s: str):
+    """'v1.2.3' / '1.2.3' -> (1, 2, 3)。非数字段按 0 处理。"""
+    s = (s or "").strip().lstrip("vV")
+    parts = []
+    for seg in s.split("."):
+        num = ""
+        for ch in seg:
+            if ch.isdigit():
+                num += ch
+            else:
+                break
+        parts.append(int(num) if num else 0)
+    return tuple(parts) if parts else (0,)
+
+
+def _is_newer(remote: str, local: str) -> bool:
+    return _parse_version(remote) > _parse_version(local)
+
+
+def _update_asset_match(name: str) -> bool:
+    """当前平台对应的发布资产文件名匹配规则。"""
+    name = (name or "").lower()
+    sysname = platform.system()
+    if sysname == "Darwin":
+        return name.endswith(".zip") and "macos" in name
+    if sysname == "Windows":
+        return name.endswith(".exe") and "win" in name
+    return False
+
+
+def _plain_notes(text: str) -> str:
+    """把 release 说明里的 markdown 标记清成干净纯文本(弹窗不渲染 markdown)。"""
+    out = []
+    for raw in (text or "").splitlines():
+        line = raw.rstrip()
+        line = re.sub(r"^\s{0,3}#{1,6}\s*", "", line)        # 标题 ##
+        line = re.sub(r"^(\s*)[-*+]\s+", r"\1• ", line)      # 无序列表 - * +
+        line = re.sub(r"^(\s*)>\s?", r"\1", line)            # 引用 >
+        line = re.sub(r"\*\*(.+?)\*\*", r"\1", line)         # 粗体 **x**
+        line = re.sub(r"(?<!\*)\*(?!\*)(.+?)\*", r"\1", line)  # 斜体 *x*
+        line = re.sub(r"`([^`]+)`", r"\1", line)             # 行内代码 `x`
+        out.append(line)
+    # 折叠多余空行
+    cleaned = re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
+    return cleaned
+
+
+def fetch_latest_release(timeout=10):
+    """请求 GitHub 最新 release，返回解析后的 dict，失败抛异常。"""
+    import urllib.request
+    req = urllib.request.Request(
+        GITHUB_API_LATEST,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": f"BitFerry/{__version__}",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    tag = data.get("tag_name", "") or ""
+    asset = None
+    for a in data.get("assets", []) or []:
+        if _update_asset_match(a.get("name", "")):
+            asset = {
+                "name": a.get("name"),
+                "url": a.get("browser_download_url"),
+                "size": a.get("size", 0) or 0,
+            }
+            break
+    return {
+        "version": tag.lstrip("vV"),
+        "tag": tag,
+        "notes": data.get("body", "") or "",
+        "page": data.get("html_url", GITHUB_RELEASES_PAGE),
+        "asset": asset,
+    }
+
+
+class UpdateSignals(QObject):
+    available = pyqtSignal(object)   # 有新版: release dict
+    uptodate = pyqtSignal()          # 已是最新
+    failed = pyqtSignal(str)         # 检查出错
+
+
+class _DLSignals(QObject):
+    progress = pyqtSignal(int, int)  # (已下载字节, 总字节)
+    finished = pyqtSignal()
+    failed = pyqtSignal(str)
+
+
+def check_for_update_async(signals: UpdateSignals):
+    """后台线程检查更新，结果通过 signals 回主线程。"""
+    def worker():
+        try:
+            rel = fetch_latest_release()
+            if rel["version"] and _is_newer(rel["version"], __version__):
+                signals.available.emit(rel)
+            else:
+                signals.uptodate.emit()
+        except Exception as e:
+            signals.failed.emit(str(e))
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def _download_with_progress(url, dest_path, expected_size,
+                            progress_cb=None, cancel_cb=None):
+    """下载到 dest_path。一期仅校验文件大小完整性。返回 True 成功 / False 取消。"""
+    import urllib.request
+    req = urllib.request.Request(
+        url, headers={"User-Agent": f"BitFerry/{__version__}"})
+    with urllib.request.urlopen(req, timeout=30) as resp, open(dest_path, "wb") as f:
+        total = expected_size or int(resp.headers.get("Content-Length", 0) or 0)
+        downloaded = 0
+        while True:
+            if cancel_cb and cancel_cb():
+                return False
+            chunk = resp.read(64 * 1024)
+            if not chunk:
+                break
+            f.write(chunk)
+            downloaded += len(chunk)
+            if progress_cb:
+                progress_cb(downloaded, total)
+    actual = dest_path.stat().st_size
+    if expected_size and actual != expected_size:
+        raise IOError(f"下载文件大小不符: 期望 {expected_size}, 实际 {actual}")
+    return True
+
+
+def _current_app_bundle():
+    """macOS: 返回正在运行的 .app 路径 (Path)，找不到返回 None。"""
+    for p in Path(sys.executable).parents:
+        if p.suffix == ".app":
+            return p
+    return None
+
+
+def apply_update_macos(zip_path):
+    """解压新包并安排"退出后替换+重启"，调用后应立即退出当前进程。"""
+    import zipfile
+    app = _current_app_bundle()
+    if app is None:
+        raise RuntimeError("未找到当前 .app，可能不是打包运行。")
+    workdir = Path(tempfile.mkdtemp(prefix="bitferry_update_"))
+    with zipfile.ZipFile(zip_path) as z:
+        z.extractall(workdir)
+    new_app = next((c for c in workdir.iterdir() if c.suffix == ".app"), None)
+    if new_app is None:
+        new_app = next(iter(workdir.rglob("*.app")), None)
+    if new_app is None:
+        raise RuntimeError("更新包内未找到 .app")
+
+    pid = os.getpid()
+    backup = app.with_name(app.name + ".bak")
+    script = workdir / "apply_update.sh"
+    # 注意: 不重新签名——发布包已用稳定自签证书签好名，重签会改变签名标识、
+    # 导致 macOS 截图(屏幕录制)的 TCC 授权失效。
+    script.write_text(f'''#!/bin/bash
+while kill -0 {pid} 2>/dev/null; do sleep 0.3; done
+sleep 0.5
+TARGET="{app}"
+NEW="{new_app}"
+BACKUP="{backup}"
+rm -rf "$BACKUP" 2>/dev/null || true
+mv "$TARGET" "$BACKUP" 2>/dev/null || true
+if mv "$NEW" "$TARGET"; then
+    xattr -dr com.apple.quarantine "$TARGET" 2>/dev/null || true
+    rm -rf "$BACKUP" 2>/dev/null || true
+    open "$TARGET"
+else
+    mv "$BACKUP" "$TARGET" 2>/dev/null || true
+    open "$TARGET"
+fi
+rm -rf "{workdir}" 2>/dev/null || true
+''', encoding="utf-8")
+    script.chmod(0o755)
+    subprocess.Popen(["/bin/bash", str(script)],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+
+
+def apply_update_windows(new_exe_path):
+    """覆盖当前 exe 并重启，调用后应立即退出当前进程。"""
+    cur = Path(sys.executable)
+    pid = os.getpid()
+    workdir = Path(new_exe_path).parent
+    bat = workdir / "apply_update.bat"
+    bat.write_text(
+        "@echo off\r\n"
+        ":waitloop\r\n"
+        f'tasklist /FI "PID eq {pid}" 2>NUL | find "{pid}" >NUL\r\n'
+        "if not errorlevel 1 (\r\n"
+        "    ping -n 2 127.0.0.1 >NUL\r\n"
+        "    goto waitloop\r\n"
+        ")\r\n"
+        "ping -n 2 127.0.0.1 >NUL\r\n"
+        f'copy /Y "{new_exe_path}" "{cur}" >NUL\r\n'
+        f'start "" "{cur}"\r\n'
+        'del "%~f0"\r\n',
+        encoding="utf-8")
+    flags = (getattr(subprocess, "CREATE_NO_WINDOW", 0)
+             | getattr(subprocess, "DETACHED_PROCESS", 0))
+    subprocess.Popen(["cmd", "/c", str(bat)], creationflags=flags)
 
 
 def main():

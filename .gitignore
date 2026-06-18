@@ -3,6 +3,10 @@ build/
 dist/
 *.spec.bak
 
+# 打包产物 / release 资产(走 GitHub Releases, 不入库)
+BitFerry-macos-arm64.zip
+BitFerry-windows-x64.exe
+
 # Python cache
 __pycache__/
 *.pyc
