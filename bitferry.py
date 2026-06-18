@@ -6791,9 +6791,11 @@ def _update_asset_match(name: str) -> bool:
     name = (name or "").lower()
     sysname = platform.system()
     if sysname == "Darwin":
-        return name.endswith(".zip") and "macos" in name
+        return name.endswith(".zip") and "mac" in name
     if sysname == "Windows":
-        return name.endswith(".exe") and "win" in name
+        # release 里 Windows 资产就一个 exe, 名字叫 BitFerry.exe 或
+        # BitFerry-windows-x64.exe 都能认, 省去每次上传改名。
+        return name.endswith(".exe")
     return False
 
 
