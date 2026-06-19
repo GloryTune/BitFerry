@@ -53,7 +53,7 @@ TRANSFER_PORT = 50809
 
 # ---------- 版本 / 在线更新 ----------
 # 发版时同步修改此处与 bitferry.spec 里的 CFBundleShortVersionString。
-__version__ = "1.1.8"
+__version__ = "1.1.9"
 GITHUB_REPO = "GloryTune/BitFerry"
 GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases/latest"
 # 检查更新走仓库里的 version.json(经 raw CDN, 不受 api.github.com 60次/小时限流);
@@ -5647,13 +5647,18 @@ class MainWindow(QMainWindow):
         sc.setSpacing(2)
         sc.addWidget(self._lbl("本机", "selfLabel"))
         name_row = QHBoxLayout()
-        name_row.setSpacing(4)
+        name_row.setSpacing(6)
+        # 名字本身也可点击修改, 并给出手型光标 + 提示, 让"可改名"更直观
         self.self_name_lbl = self._lbl(self.hostname, "selfName")
+        self.self_name_lbl.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.self_name_lbl.setToolTip("点击修改本机名称")
+        self.self_name_lbl.mousePressEvent = (
+            lambda e: self.action_rename_device())
         name_row.addWidget(self.self_name_lbl, 1)
-        btn_rename = QPushButton("✎")
-        btn_rename.setObjectName("tool")
-        btn_rename.setFixedSize(22, 22)
-        btn_rename.setToolTip("修改本机显示名称")
+        # 明确的文字按钮: 一眼能看出这里能改名
+        btn_rename = QPushButton("✎ 改名")
+        btn_rename.setObjectName("miniBtn")
+        btn_rename.setToolTip("修改本机在局域网中显示的名称")
         btn_rename.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_rename.clicked.connect(self.action_rename_device)
         name_row.addWidget(btn_rename)
