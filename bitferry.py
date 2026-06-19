@@ -53,7 +53,7 @@ TRANSFER_PORT = 50809
 
 # ---------- 版本 / 在线更新 ----------
 # 发版时同步修改此处与 bitferry.spec 里的 CFBundleShortVersionString。
-__version__ = "1.1.5"
+__version__ = "1.1.6"
 GITHUB_REPO = "GloryTune/BitFerry"
 GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases/latest"
 # 检查更新走仓库里的 version.json(经 raw CDN, 不受 api.github.com 60次/小时限流);
@@ -5382,7 +5382,16 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "更新失败", f"安装更新时出错：\n{e}")
                 return
             self._force_quit = True
-            QApplication.quit()
+            # 必须硬退出: 此处身处嵌套模态事件循环(dlg.exec / box.exec)内,
+            # QApplication.quit() 往往无法真正结束进程 → 旧 exe 不退出、文件锁
+            # 不释放, 更新脚本的等待循环就会一直卡住(残留命令行窗口、更新不生效)。
+            # 先落盘再 os._exit 立即让出进程, 交给更新脚本完成替换并重启。
+            try:
+                self._save_history()
+                self._save_devices()
+            except Exception:
+                pass
+            os._exit(0)
         sig.finished.connect(_done)
 
         def _failed(msg):
@@ -7198,12 +7207,16 @@ def apply_update_windows(new_exe_path):
         f'set "DST={cur}"\r\n'
         f'set "LOG={log}"\r\n'
         f'echo [%date% %time%] waiting for pid {pid} > "%LOG%"\r\n'
+        "set /a waited=0\r\n"
         ":waitloop\r\n"
         f'tasklist /FI "PID eq {pid}" /NH 2>NUL | find "{pid}" >NUL\r\n'
-        "if not errorlevel 1 (\r\n"
-        "    ping -n 2 127.0.0.1 >NUL\r\n"
-        "    goto waitloop\r\n"
-        ")\r\n"
+        "if errorlevel 1 goto gone\r\n"
+        "set /a waited+=1\r\n"
+        # 兜底: 进程迟迟不退出(旧版本可能卡在事件循环)时强制结束, 避免无限等待
+        f'if %waited% geq 15 taskkill /PID {pid} /F >NUL 2>&1\r\n'
+        "ping -n 2 127.0.0.1 >NUL\r\n"
+        "goto waitloop\r\n"
+        ":gone\r\n"
         "ping -n 2 127.0.0.1 >NUL\r\n"
         "set /a tries=0\r\n"
         ":copyloop\r\n"
@@ -7216,8 +7229,9 @@ def apply_update_windows(new_exe_path):
         'start "" "%DST%"\r\n'
         'del "%~f0"\r\n',
         encoding="utf-8")
-    flags = (getattr(subprocess, "CREATE_NO_WINDOW", 0)
-             | getattr(subprocess, "DETACHED_PROCESS", 0))
+    # 只用 CREATE_NO_WINDOW: 它单独即可让 cmd 无窗口运行; 再叠加 DETACHED_PROCESS
+    # 会与之冲突, 反而弹出可见的命令行窗口。父进程退出后该 cmd 仍会继续执行。
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     subprocess.Popen(["cmd", "/c", str(bat)], creationflags=flags)
 
 
