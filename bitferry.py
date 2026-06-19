@@ -53,7 +53,7 @@ TRANSFER_PORT = 50809
 
 # ---------- 版本 / 在线更新 ----------
 # 发版时同步修改此处与 bitferry.spec 里的 CFBundleShortVersionString。
-__version__ = "1.1.6"
+__version__ = "1.1.7"
 GITHUB_REPO = "GloryTune/BitFerry"
 GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases/latest"
 # 检查更新走仓库里的 version.json(经 raw CDN, 不受 api.github.com 60次/小时限流);
@@ -4333,6 +4333,23 @@ class SettingsDialog(QDialog):
         swatch_row.addStretch()
         th_lay.addLayout(swatch_row)
         lay.addWidget(th_box)
+
+        # --- 关于区块 ---
+        ab_box = QFrame()
+        ab_box.setObjectName("selfCard")
+        ab_lay = QVBoxLayout(ab_box)
+        ab_lay.setContentsMargins(16, 14, 16, 16)
+        ab_lay.setSpacing(6)
+        ab_title = QLabel("关于")
+        ab_title.setObjectName("selfName")
+        ab_lay.addWidget(ab_title)
+        ab_info = QLabel(f"BitFerry 内网快传  ·  版本 {__version__}")
+        ab_info.setStyleSheet(f"color:{rc}; font-size:12px;")
+        ab_lay.addWidget(ab_info)
+        ab_author = QLabel("作者：Yang Tianyou")
+        ab_author.setStyleSheet(f"color:{rc}; font-size:12px;")
+        ab_lay.addWidget(ab_author)
+        lay.addWidget(ab_box)
 
         # --- 按钮行 ---
         btn_row = QHBoxLayout()
