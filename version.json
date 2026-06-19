@@ -1,6 +1,6 @@
 {
-  "version": "1.1.9",
-  "notes": "## 本次更新\n\n- 「本机」名字改名入口更直观：名字本身可点击修改，并新增明确的「✎ 改名」按钮（不再是不易察觉的小图标）。\n- 延续 1.1.8 的更新器修复（等父子进程都退出再覆盖，避免更新后报 Failed to load Python DLL）。",
+  "version": "1.1.10",
+  "notes": "## 本次更新\n\n- 修复更新后弹出 `Failed to load Python DLL` 的问题：覆盖出的新 exe 会被杀软立即扫描并锁定，旧逻辑随即启动导致 onefile 解包失败。现在会轮询等待文件锁释放后再启动，更稳定。\n- 「改名」按钮改为更优雅的轻量胶囊样式（强调色文字），名字本身也可点击修改。",
   "assets": {
     "darwin": "BitFerry-macos-arm64.zip",
     "windows": "BitFerry-windows-x64.exe"

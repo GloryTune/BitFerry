@@ -53,7 +53,7 @@ TRANSFER_PORT = 50809
 
 # ---------- 版本 / 在线更新 ----------
 # 发版时同步修改此处与 bitferry.spec 里的 CFBundleShortVersionString。
-__version__ = "1.1.9"
+__version__ = "1.1.10"
 GITHUB_REPO = "GloryTune/BitFerry"
 GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases/latest"
 # 检查更新走仓库里的 version.json(经 raw CDN, 不受 api.github.com 60次/小时限流);
@@ -436,6 +436,10 @@ _STYLE_TPL = (
     "QPushButton#miniBtn {{ background:{s2}; color:{t2}; border:1px solid {b2};"
         " border-radius:{btn_r}; padding:6px 0; font-size:11px; font-weight:600; }}\n"
     "QPushButton#miniBtn:hover {{ background:{s3}; border:1px solid {accent}; color:{t1}; }}\n"
+    # 改名: 轻量胶囊样式, 用强调色文字, 优雅且一眼可点
+    "QPushButton#renameBtn {{ background:transparent; color:{accent}; border:1px solid {b2};"
+        " border-radius:12px; padding:3px 12px; font-size:11px; font-weight:600; }}\n"
+    "QPushButton#renameBtn:hover {{ background:{s2}; border:1px solid {accent}; }}\n"
     "#sectionLabel {{ color:{t3}; font-size:10px; font-weight:700; letter-spacing:1.5px; }}\n"
     "QListWidget {{ background:transparent; border:none; outline:none; }}\n"
     "QListWidget::item {{ background:{li}; border:1px solid {li_b}; border-radius:{item_r}; margin-bottom:8px; }}\n"
@@ -5655,9 +5659,9 @@ class MainWindow(QMainWindow):
         self.self_name_lbl.mousePressEvent = (
             lambda e: self.action_rename_device())
         name_row.addWidget(self.self_name_lbl, 1)
-        # 明确的文字按钮: 一眼能看出这里能改名
+        # 明确的文字按钮: 一眼能看出这里能改名(轻量胶囊样式)
         btn_rename = QPushButton("✎ 改名")
-        btn_rename.setObjectName("miniBtn")
+        btn_rename.setObjectName("renameBtn")
         btn_rename.setToolTip("修改本机在局域网中显示的名称")
         btn_rename.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_rename.clicked.connect(self.action_rename_device)
@@ -7269,12 +7273,24 @@ def apply_update_windows(new_exe_path):
         "set /a tries=0\r\n"
         ":copyloop\r\n"
         'copy /Y "%SRC%" "%DST%" >> "%LOG%" 2>&1\r\n'
-        "if not errorlevel 1 goto launch\r\n"
+        "if not errorlevel 1 goto copied\r\n"
         "set /a tries+=1\r\n"
         "if %tries% lss 20 (ping -n 2 127.0.0.1 >NUL & goto copyloop)\r\n"
         'echo [%date% %time%] copy failed after %tries% tries >> "%LOG%"\r\n'
+        "goto launch\r\n"
+        ":copied\r\n"
+        # 关键: 刚覆盖出来的是未签名新 exe, Windows Defender 会立即扫描并独占锁定它。
+        # 若此时就启动, onefile 引导器解包不出 pythonXXX.dll, 会弹 "Failed to load
+        # Python DLL"。这里轮询到该文件可被独占打开(扫描放锁)后再启动, 比盲等更稳。
+        'echo [%date% %time%] copied, waiting for AV/file lock to clear >> "%LOG%"\r\n'
+        "set /a lk=0\r\n"
+        ":lockwait\r\n"
+        '(call ) 9>>"%DST%" 2>NUL && goto launch\r\n'
+        "set /a lk+=1\r\n"
+        'if %lk% geq 40 (echo [%date% %time%] still locked, launching anyway >> "%LOG%" & goto launch)\r\n'
+        "ping -n 2 127.0.0.1 >NUL\r\n"
+        "goto lockwait\r\n"
         ":launch\r\n"
-        # 覆盖后再稍等, 确保新 exe 已完整落盘, 再启动(避免读到半截文件)
         "ping -n 2 127.0.0.1 >NUL\r\n"
         'start "" "%DST%"\r\n'
         'del "%~f0"\r\n',
