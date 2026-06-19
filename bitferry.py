@@ -53,7 +53,7 @@ TRANSFER_PORT = 50809
 
 # ---------- 版本 / 在线更新 ----------
 # 发版时同步修改此处与 bitferry.spec 里的 CFBundleShortVersionString。
-__version__ = "1.1.10"
+__version__ = "1.1.11"
 GITHUB_REPO = "GloryTune/BitFerry"
 GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases/latest"
 # 检查更新走仓库里的 version.json(经 raw CDN, 不受 api.github.com 60次/小时限流);
@@ -436,10 +436,6 @@ _STYLE_TPL = (
     "QPushButton#miniBtn {{ background:{s2}; color:{t2}; border:1px solid {b2};"
         " border-radius:{btn_r}; padding:6px 0; font-size:11px; font-weight:600; }}\n"
     "QPushButton#miniBtn:hover {{ background:{s3}; border:1px solid {accent}; color:{t1}; }}\n"
-    # 改名: 轻量胶囊样式, 用强调色文字, 优雅且一眼可点
-    "QPushButton#renameBtn {{ background:transparent; color:{accent}; border:1px solid {b2};"
-        " border-radius:12px; padding:3px 12px; font-size:11px; font-weight:600; }}\n"
-    "QPushButton#renameBtn:hover {{ background:{s2}; border:1px solid {accent}; }}\n"
     "#sectionLabel {{ color:{t3}; font-size:10px; font-weight:700; letter-spacing:1.5px; }}\n"
     "QListWidget {{ background:transparent; border:none; outline:none; }}\n"
     "QListWidget::item {{ background:{li}; border:1px solid {li_b}; border-radius:{item_r}; margin-bottom:8px; }}\n"
@@ -5650,23 +5646,13 @@ class MainWindow(QMainWindow):
         sc.setContentsMargins(14, 12, 14, 12)
         sc.setSpacing(2)
         sc.addWidget(self._lbl("本机", "selfLabel"))
-        name_row = QHBoxLayout()
-        name_row.setSpacing(6)
-        # 名字本身也可点击修改, 并给出手型光标 + 提示, 让"可改名"更直观
+        # 改名入口: 名字本身可点击修改——手型光标 + 悬停提示, 不再额外放按钮, 更简洁优雅
         self.self_name_lbl = self._lbl(self.hostname, "selfName")
         self.self_name_lbl.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.self_name_lbl.setToolTip("点击修改本机名称")
+        self.self_name_lbl.setToolTip("单击以修改本机名称")
         self.self_name_lbl.mousePressEvent = (
             lambda e: self.action_rename_device())
-        name_row.addWidget(self.self_name_lbl, 1)
-        # 明确的文字按钮: 一眼能看出这里能改名(轻量胶囊样式)
-        btn_rename = QPushButton("✎ 改名")
-        btn_rename.setObjectName("renameBtn")
-        btn_rename.setToolTip("修改本机在局域网中显示的名称")
-        btn_rename.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_rename.clicked.connect(self.action_rename_device)
-        name_row.addWidget(btn_rename)
-        sc.addLayout(name_row)
+        sc.addWidget(self.self_name_lbl)
         sc.addWidget(self._lbl(self.local_ip, "selfIp"))
         sb.addWidget(selfCard)
 
