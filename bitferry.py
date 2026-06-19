@@ -53,7 +53,7 @@ TRANSFER_PORT = 50809
 
 # ---------- 版本 / 在线更新 ----------
 # 发版时同步修改此处与 bitferry.spec 里的 CFBundleShortVersionString。
-__version__ = "1.1.4"
+__version__ = "1.1.5"
 GITHUB_REPO = "GloryTune/BitFerry"
 GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases/latest"
 # 检查更新走仓库里的 version.json(经 raw CDN, 不受 api.github.com 60次/小时限流);
@@ -2687,6 +2687,27 @@ class Discovery:
         except Exception:
             pass
 
+    def note_active_peer(self, ip, name=None, port=None, uid=None):
+        """收到对端入站连接(传输/聊天)即视为其在线。UDP announce 可能因防火墙
+        或单向可达而收不到, 但既然对方能连上来, 它必定在线且可回连——据此立即
+        刷新 presence, 并回敬一次单播 announce, 引导后续双向发现持续生效。"""
+        if not ip or ip in self._all_ips():
+            return
+        with self.lock:
+            p = self.peers.get(ip, {})
+            p["last"] = time.time()
+            p["name"] = name or p.get("name", ip)
+            p["port"] = port or p.get("port", TRANSFER_PORT)
+            if uid:
+                p["uid"] = uid
+            p.setdefault("uid", None)
+            p["_online"] = True
+            self.peers[ip] = p
+        self.on_peers_change(self.snapshot())
+        # 回敬单播 announce: 对方收到后会再单播回应, 我方据此持续看到它在线
+        threading.Thread(target=self._unicast_reply, args=(ip,),
+                         daemon=True).start()
+
     def _broadcaster(self):
         """每个真实 LAN IP 分别广播 announce，VPN 开启时依然能发现对端。"""
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -2776,7 +2797,7 @@ class Receiver:
     """统一接收: 文件 / 文字 / 图片。"""
     def __init__(self, on_file, on_chat, on_log, on_progress=None,
                  get_recv_confirm=None, on_recv_started=None, on_recv_done=None,
-                 on_recv_cancelled=None):
+                 on_recv_cancelled=None, on_peer_seen=None):
         self.on_file = on_file             # (path, sender)
         self.on_chat = on_chat             # (sender_name, sender_ip, kind, payload)
         self.on_log = on_log
@@ -2785,6 +2806,7 @@ class Receiver:
         self.on_recv_started = on_recv_started    # (recv_id, sender, sender_ip, meta_json)
         self.on_recv_done = on_recv_done          # (recv_id)
         self.on_recv_cancelled = on_recv_cancelled  # (recv_id)
+        self.on_peer_seen = on_peer_seen   # (sender_ip, name, uid, port) 入站连接即在线
         self.running = True
 
     def start(self):
@@ -2828,6 +2850,15 @@ class Receiver:
             sender = header.get("sender", addr[0])
             sender_ip = addr[0]
             size = header.get("size", 0)
+
+            # 对方能连上来 = 它一定在线且可回连; 据此立即刷新在线状态,
+            # 不依赖可能被防火墙拦掉的 UDP 广播。带上 uid 以便多 IP 归并成一台。
+            if self.on_peer_seen:
+                try:
+                    self.on_peer_seen(sender_ip, sender, header.get("uid"),
+                                      header.get("port") or TRANSFER_PORT)
+                except Exception:
+                    pass
 
             if kind == "text":
                 self.on_chat(sender, sender_ip, "text", header.get("text", ""))
@@ -3093,6 +3124,12 @@ class Receiver:
         return got
 
 
+def _my_uid():
+    """本机稳定设备标识(与 Discovery 共用 settings 里的 device_uid)。
+    随传输头一起发出, 接收方据此把同一台机器的多个 IP 归并成一台。"""
+    return get_setting("device_uid", None)
+
+
 def _send_frame(peer_ip, peer_port, header, payload=b""):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(10.0)
@@ -3110,7 +3147,8 @@ def _send_frame(peer_ip, peer_port, header, payload=b""):
 def send_text(text, peer_ip, peer_port, sender_name, on_log):
     try:
         _send_frame(peer_ip, peer_port,
-                    {"kind": "text", "sender": sender_name, "text": text})
+                    {"kind": "text", "sender": sender_name, "uid": _my_uid(),
+                     "text": text})
         return True
     except Exception as e:
         on_log(f"消息发送失败: {e}", "error")
@@ -3120,8 +3158,8 @@ def send_text(text, peer_ip, peer_port, sender_name, on_log):
 def send_image_bytes(data, peer_ip, peer_port, sender_name, on_log):
     try:
         _send_frame(peer_ip, peer_port,
-                    {"kind": "image", "sender": sender_name, "size": len(data),
-                     "filename": "image.png"}, data)
+                    {"kind": "image", "sender": sender_name, "uid": _my_uid(),
+                     "size": len(data), "filename": "image.png"}, data)
         return True
     except Exception as e:
         on_log(f"图片发送失败: {e}", "error")
@@ -3134,7 +3172,7 @@ def send_file(filepath, peer_ip, peer_port, sender_name, on_log):
         with open(filepath, "rb") as f:
             data = f.read()
         _send_frame(peer_ip, peer_port,
-                    {"kind": "file", "sender": sender_name,
+                    {"kind": "file", "sender": sender_name, "uid": _my_uid(),
                      "filename": filepath.name, "size": len(data)}, data)
         on_log(f"已发送 {filepath.name} → {peer_ip}", "send")
         return True
@@ -3188,7 +3226,8 @@ def send_batch(items, peer_ip, peer_port, sender_name, on_log,
         if ctrl and ctrl.is_cancelled:
             return "cancelled"
 
-        header = {"kind": "batch", "sender": sender_name, "parts": parts}
+        header = {"kind": "batch", "sender": sender_name, "uid": _my_uid(),
+                  "parts": parts}
         # 再次检查：连接之前若已取消则直接退出，避免 header 已发出而对方开始等待数据
         if ctrl and ctrl.is_cancelled:
             return "cancelled"
@@ -5157,7 +5196,9 @@ class MainWindow(QMainWindow):
             get_recv_confirm=lambda: get_setting("recv_confirm", False),
             on_recv_started=lambda rid, sn, sip, meta: self.signals.recv_started.emit(rid, sn, sip, meta),
             on_recv_done=lambda rid: self.signals.recv_done.emit(rid),
-            on_recv_cancelled=lambda rid: self.signals.recv_cancelled.emit(rid))
+            on_recv_cancelled=lambda rid: self.signals.recv_cancelled.emit(rid),
+            on_peer_seen=lambda ip, name, uid, port: self.discovery.note_active_peer(
+                ip, name, port, uid))
         self.receiver.start()
 
         self._rebuild_peer_list()
