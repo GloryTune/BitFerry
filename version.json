@@ -1,6 +1,6 @@
 {
-  "version": "1.1.3",
-  "notes": "## 本次更新\n\n- 修复检查更新时 GitHub API 限流导致的 `HTTP 403 rate limit exceeded`：改用仓库 version.json（经 raw CDN，不受 60次/小时 限制），VPN 共用出口 IP 也不再被限流。\n- 沿用 1.1.2 的证书库修复（HTTPS 校验）。",
+  "version": "1.1.4",
+  "notes": "## 本次更新\n\n- 修复 Windows 在线更新两处问题：下载进度框百分比显示乱码；下载完成后偶尔没有覆盖安装（exe 文件锁未及时释放导致一次性 copy 失败）。\n- 进度框改为显示「已下载 X / Y MB (Z%)」，覆盖安装改为带重试并记录 apply_update.log。\n- 注意：本修复对「从 1.1.3 及更早版本升级上来」这一次不生效（执行更新的是旧版下载器），从 1.1.4 往后的升级才会用到修复后的逻辑。",
   "assets": {
     "darwin": "BitFerry-macos-arm64.zip",
     "windows": "BitFerry-windows-x64.exe"

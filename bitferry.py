@@ -53,7 +53,7 @@ TRANSFER_PORT = 50809
 
 # ---------- 版本 / 在线更新 ----------
 # 发版时同步修改此处与 bitferry.spec 里的 CFBundleShortVersionString。
-__version__ = "1.1.3"
+__version__ = "1.1.4"
 GITHUB_REPO = "GloryTune/BitFerry"
 GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases/latest"
 # 检查更新走仓库里的 version.json(经 raw CDN, 不受 api.github.com 60次/小时限流);
@@ -5294,7 +5294,7 @@ class MainWindow(QMainWindow):
                     "当前为源码运行，已打开发布页，请手动下载新版本。")
             return
 
-        from PyQt6.QtWidgets import QProgressDialog
+        from PyQt6.QtWidgets import QProgressDialog, QProgressBar
         tmpdir = Path(tempfile.mkdtemp(prefix="bitferry_dl_"))
         dest = tmpdir / asset["name"]
         total = asset.get("size", 0)
@@ -5304,6 +5304,11 @@ class MainWindow(QMainWindow):
         dlg.setAutoClose(False)
         dlg.setAutoReset(False)
         dlg.setMinimumDuration(0)
+        # 进度条自带的百分比文字在打包后会渲染成乱码, 隐藏它,
+        # 改在标签里显示"已下载 X / Y MB (Z%)"。
+        _bar = QProgressBar(dlg)
+        _bar.setTextVisible(False)
+        dlg.setBar(_bar)
         dlg.setValue(0)
 
         sig = _DLSignals()
@@ -5311,12 +5316,18 @@ class MainWindow(QMainWindow):
         state = {"cancel": False}
         dlg.canceled.connect(lambda: state.update(cancel=True))
 
+        _mb = 1024 * 1024
+
         def _progress(done, tot):
             if tot:
                 dlg.setMaximum(tot)
                 dlg.setValue(done)
+                pct = int(done * 100 / tot)
+                dlg.setLabelText(
+                    f"正在下载更新… {done/_mb:.1f} / {tot/_mb:.1f} MB ({pct}%)")
             else:
                 dlg.setRange(0, 0)
+                dlg.setLabelText(f"正在下载更新… {done/_mb:.1f} MB")
         sig.progress.connect(_progress)
 
         def _done():
@@ -7135,17 +7146,33 @@ def apply_update_windows(new_exe_path):
     pid = os.getpid()
     workdir = Path(new_exe_path).parent
     bat = workdir / "apply_update.bat"
+    log = workdir / "apply_update.log"
+    # 旧版本一次性 copy 且把错误丢进 NUL: 进程刚退出时 exe 文件锁可能还没释放,
+    # 首次 copy 失败就再无重试, 表现为"下载完没覆盖"。这里改为带重试的 copy,
+    # 并把结果写进 apply_update.log 方便排查; 无论成败最后都会拉起程序。
     bat.write_text(
         "@echo off\r\n"
+        "setlocal\r\n"
+        f'set "SRC={new_exe_path}"\r\n'
+        f'set "DST={cur}"\r\n'
+        f'set "LOG={log}"\r\n'
+        f'echo [%date% %time%] waiting for pid {pid} > "%LOG%"\r\n'
         ":waitloop\r\n"
-        f'tasklist /FI "PID eq {pid}" 2>NUL | find "{pid}" >NUL\r\n'
+        f'tasklist /FI "PID eq {pid}" /NH 2>NUL | find "{pid}" >NUL\r\n'
         "if not errorlevel 1 (\r\n"
         "    ping -n 2 127.0.0.1 >NUL\r\n"
         "    goto waitloop\r\n"
         ")\r\n"
         "ping -n 2 127.0.0.1 >NUL\r\n"
-        f'copy /Y "{new_exe_path}" "{cur}" >NUL\r\n'
-        f'start "" "{cur}"\r\n'
+        "set /a tries=0\r\n"
+        ":copyloop\r\n"
+        'copy /Y "%SRC%" "%DST%" >> "%LOG%" 2>&1\r\n'
+        "if not errorlevel 1 goto launch\r\n"
+        "set /a tries+=1\r\n"
+        "if %tries% lss 20 (ping -n 2 127.0.0.1 >NUL & goto copyloop)\r\n"
+        'echo [%date% %time%] copy failed after %tries% tries >> "%LOG%"\r\n'
+        ":launch\r\n"
+        'start "" "%DST%"\r\n'
         'del "%~f0"\r\n',
         encoding="utf-8")
     flags = (getattr(subprocess, "CREATE_NO_WINDOW", 0)
