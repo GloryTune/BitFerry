@@ -53,7 +53,7 @@ TRANSFER_PORT = 50809
 
 # ---------- 版本 / 在线更新 ----------
 # 发版时同步修改此处与 bitferry.spec 里的 CFBundleShortVersionString。
-__version__ = "1.1.7"
+__version__ = "1.1.8"
 GITHUB_REPO = "GloryTune/BitFerry"
 GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases/latest"
 # 检查更新走仓库里的 version.json(经 raw CDN, 不受 api.github.com 60次/小时限流);
@@ -4175,7 +4175,20 @@ class SettingsDialog(QDialog):
         self._build()
 
     def _build(self):
-        lay = QVBoxLayout(self)
+        from PyQt6.QtWidgets import QScrollArea
+        # 外层布局: 可滚动的内容区 + 固定在底部的按钮行(按钮始终可见)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        content = QWidget()
+        scroll.setWidget(content)
+        outer.addWidget(scroll, 1)
+
+        lay = QVBoxLayout(content)
         lay.setSpacing(16)
         lay.setContentsMargins(24, 22, 24, 22)
 
@@ -4351,8 +4364,10 @@ class SettingsDialog(QDialog):
         ab_lay.addWidget(ab_author)
         lay.addWidget(ab_box)
 
-        # --- 按钮行 ---
-        btn_row = QHBoxLayout()
+        # --- 按钮行(固定在底部, 不随内容滚动) ---
+        btn_bar = QWidget()
+        btn_row = QHBoxLayout(btn_bar)
+        btn_row.setContentsMargins(24, 12, 24, 16)
         btn_row.addStretch()
         btn_cancel = QPushButton("取消")
         btn_cancel.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -4363,7 +4378,13 @@ class SettingsDialog(QDialog):
         btn_ok.clicked.connect(self._save_and_accept)
         btn_row.addWidget(btn_cancel)
         btn_row.addWidget(btn_ok)
-        lay.addLayout(btn_row)
+        outer.addWidget(btn_bar)
+
+        # 限制对话框高度: 内容很高时不再撑满屏幕, 改为在内容区滚动
+        screen = QGuiApplication.primaryScreen()
+        avail_h = screen.availableGeometry().height() if screen else 800
+        self.setMaximumHeight(int(avail_h * 0.9))
+        self.resize(500, min(int(avail_h * 0.85), 760))
 
     def _apply_preview(self, name: str):
         """立即将主题应用到全局所有窗口，让用户实时看到效果。"""
@@ -7210,31 +7231,36 @@ rm -rf "{workdir}" 2>/dev/null || true
 def apply_update_windows(new_exe_path):
     """覆盖当前 exe 并重启，调用后应立即退出当前进程。"""
     cur = Path(sys.executable)
-    pid = os.getpid()
+    pid = os.getpid()          # 子进程(Python 运行所在)
+    ppid = os.getppid()        # onefile 引导器(父进程): 锁着 exe 文件、拥有 _MEI 解包目录
     workdir = Path(new_exe_path).parent
     bat = workdir / "apply_update.bat"
     log = workdir / "apply_update.log"
-    # 旧版本一次性 copy 且把错误丢进 NUL: 进程刚退出时 exe 文件锁可能还没释放,
-    # 首次 copy 失败就再无重试, 表现为"下载完没覆盖"。这里改为带重试的 copy,
-    # 并把结果写进 apply_update.log 方便排查; 无论成败最后都会拉起程序。
+    # 关键: onefile exe 同时有引导器(父)和子进程两个进程, 两者都锁着 exe 文件、
+    # 父进程还拥有 _MEI 临时解包目录。必须等"父+子都退出"才能覆盖, 否则在父进程
+    # 仍存活时替换 exe, 会损坏其正在运行的映像, 重启时报 "Failed to load Python DLL
+    # (_MEI...\pythonXXX.dll)"。这里等两个 PID 都消失、再留出落地时间后才覆盖+重启。
     bat.write_text(
         "@echo off\r\n"
         "setlocal\r\n"
         f'set "SRC={new_exe_path}"\r\n'
         f'set "DST={cur}"\r\n'
         f'set "LOG={log}"\r\n'
-        f'echo [%date% %time%] waiting for pid {pid} > "%LOG%"\r\n'
+        f'echo [%date% %time%] waiting for pids {pid} {ppid} > "%LOG%"\r\n'
         "set /a waited=0\r\n"
         ":waitloop\r\n"
-        f'tasklist /FI "PID eq {pid}" /NH 2>NUL | find "{pid}" >NUL\r\n'
-        "if errorlevel 1 goto gone\r\n"
+        'set "alive="\r\n'
+        f'tasklist /FI "PID eq {pid}" /NH 2>NUL | find "{pid}" >NUL && set alive=1\r\n'
+        f'tasklist /FI "PID eq {ppid}" /NH 2>NUL | find "{ppid}" >NUL && set alive=1\r\n'
+        "if not defined alive goto gone\r\n"
         "set /a waited+=1\r\n"
-        # 兜底: 进程迟迟不退出(旧版本可能卡在事件循环)时强制结束, 避免无限等待
-        f'if %waited% geq 15 taskkill /PID {pid} /F >NUL 2>&1\r\n'
+        # 兜底: 子进程迟迟不退出时强制结束, 避免无限等待(父引导器随后会自行退出)
+        f'if %waited% geq 20 taskkill /PID {pid} /F >NUL 2>&1\r\n'
         "ping -n 2 127.0.0.1 >NUL\r\n"
         "goto waitloop\r\n"
         ":gone\r\n"
-        "ping -n 2 127.0.0.1 >NUL\r\n"
+        # 留出时间让 OS 彻底释放 exe 文件锁、引导器清理完 _MEI
+        "ping -n 3 127.0.0.1 >NUL\r\n"
         "set /a tries=0\r\n"
         ":copyloop\r\n"
         'copy /Y "%SRC%" "%DST%" >> "%LOG%" 2>&1\r\n'
@@ -7243,6 +7269,8 @@ def apply_update_windows(new_exe_path):
         "if %tries% lss 20 (ping -n 2 127.0.0.1 >NUL & goto copyloop)\r\n"
         'echo [%date% %time%] copy failed after %tries% tries >> "%LOG%"\r\n'
         ":launch\r\n"
+        # 覆盖后再稍等, 确保新 exe 已完整落盘, 再启动(避免读到半截文件)
+        "ping -n 2 127.0.0.1 >NUL\r\n"
         'start "" "%DST%"\r\n'
         'del "%~f0"\r\n',
         encoding="utf-8")
