@@ -53,7 +53,7 @@ TRANSFER_PORT = 50809
 
 # ---------- 版本 / 在线更新 ----------
 # 发版时同步修改此处与 bitferry.spec 里的 CFBundleShortVersionString。
-__version__ = "1.1.11"
+__version__ = "1.1.12"
 GITHUB_REPO = "GloryTune/BitFerry"
 GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases/latest"
 # 检查更新走仓库里的 version.json(经 raw CDN, 不受 api.github.com 60次/小时限流);
@@ -7271,13 +7271,21 @@ def apply_update_windows(new_exe_path):
         'echo [%date% %time%] copied, waiting for AV/file lock to clear >> "%LOG%"\r\n'
         "set /a lk=0\r\n"
         ":lockwait\r\n"
-        '(call ) 9>>"%DST%" 2>NUL && goto launch\r\n'
+        '(call ) 9>>"%DST%" 2>NUL && goto warm\r\n'
         "set /a lk+=1\r\n"
-        'if %lk% geq 40 (echo [%date% %time%] still locked, launching anyway >> "%LOG%" & goto launch)\r\n'
+        'if %lk% geq 40 (echo [%date% %time%] still locked, continuing >> "%LOG%" & goto warm)\r\n'
         "ping -n 2 127.0.0.1 >NUL\r\n"
         "goto lockwait\r\n"
+        ":warm\r\n"
+        # 仅文件写锁释放还不够: 新 exe 是未签名文件, 启动时 Defender 会做"执行时扫描",
+        # 它会打断 onefile 引导器解包, 导致 pythonXXX.dll 加载失败。这里先整文件读取
+        # 一遍(certutil 计算哈希), 强制杀软完成内容扫描并缓存结论; 之后再启动时走缓存,
+        # 不再触发会打断解包的扫描。
+        'echo [%date% %time%] warming AV scan cache >> "%LOG%"\r\n'
+        'certutil -hashfile "%DST%" SHA256 >> "%LOG%" 2>&1\r\n'
+        "ping -n 3 127.0.0.1 >NUL\r\n"
         ":launch\r\n"
-        "ping -n 2 127.0.0.1 >NUL\r\n"
+        'echo [%date% %time%] launching >> "%LOG%"\r\n'
         'start "" "%DST%"\r\n'
         'del "%~f0"\r\n',
         encoding="utf-8")
