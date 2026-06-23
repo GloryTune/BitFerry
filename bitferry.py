@@ -53,7 +53,7 @@ TRANSFER_PORT = 50809
 
 # ---------- 版本 / 在线更新 ----------
 # 发版时同步修改此处与 bitferry.spec 里的 CFBundleShortVersionString。
-__version__ = "1.1.14"
+__version__ = "1.1.15"
 GITHUB_REPO = "GloryTune/BitFerry"
 GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases/latest"
 # 检查更新走仓库里的 version.json(经 raw CDN, 不受 api.github.com 60次/小时限流);
@@ -5207,7 +5207,8 @@ class MainWindow(QMainWindow):
         self.history = self._load_history()    # ip -> [...] 持久, 供聊天记录弹窗用
         self.session = {}                      # ip -> [...] 仅本次运行, 新开对话为空
         self.current_ip = None
-        self.unread = {}                       # ip -> int 未读条数
+        self.unread = {}                       # device_key -> int 未读条数(按设备归并, 不随对端换 IP 而漏算)
+        self._msg_seq = 0                      # 全局递增序号, 用于跨 IP 合并同一设备的消息时保持顺序
         self.offline_queue = load_offline_queue()  # ip -> [{send_items, record_parts, ts}]
         self.staged_receives = {}              # ip -> [{parts, ts, name}] 待确认接收
         self._peer_list_state = {}             # 用于跳过无变化的重绘
@@ -5971,6 +5972,7 @@ class MainWindow(QMainWindow):
             self._delete_peer(ip)
 
     def _delete_peer(self, ip):
+        self.unread.pop(self._device_key(ip), None)   # 先按设备清未读(需 known 仍在)
         if ip in self.known:
             del self.known[ip]
             self._save_devices()
@@ -5979,7 +5981,6 @@ class MainWindow(QMainWindow):
             self._save_history()
         if ip in self.session:
             del self.session[ip]
-        self.unread.pop(ip, None)
         if self.current_ip == ip:
             self.current_ip = None
             self.right.setCurrentIndex(0)
@@ -6022,6 +6023,25 @@ class MainWindow(QMainWindow):
         name = self.online.get(ip, {}).get("name") or self.known.get(ip, {}).get("name")
         return f"name:{name}" if name else f"ip:{ip}"
 
+    def _canonical_ip(self, ip):
+        """把同一台设备的多个/变化的 IP 归一到一个代表 IP。
+        消息气泡、未读、会话都按这个代表 IP 归位，使对端换 IP/跨网段时
+        消息仍落进同一个聊天。与 _rebuild_peer_list 的 pick_rep 选法一致，
+        保证「列表里显示的那一项」就是「消息归入的那一项」。"""
+        if not ip:
+            return ip
+        key = self._device_key(ip)
+        same = [k for k in (set(self.known) | set(self.online) | {ip})
+                if self._device_key(k) == key]
+        # 正在打开的同设备聊天优先，避免气泡/选中态跳走
+        if self.current_ip in same:
+            return self.current_ip
+        return sorted(same, key=lambda k: (
+            0 if self.online.get(k, {}).get("online") else 1,  # 在线优先
+            0 if self._same_subnet(k) else 1,                  # 同网段优先
+            k,
+        ))[0]
+
     def _same_subnet(self, ip):
         try:
             local = getattr(self.discovery, "local_ip", "")
@@ -6038,14 +6058,8 @@ class MainWindow(QMainWindow):
             groups.setdefault(self._device_key(ip), []).append(ip)
 
         def pick_rep(ips):
-            # 当前正在聊天的 IP 若在本组，优先保留它，避免选中态/会话跳走
-            if self.current_ip in ips:
-                return self.current_ip
-            return sorted(ips, key=lambda ip: (
-                0 if self.online.get(ip, {}).get("online") else 1,  # 在线优先
-                0 if self._same_subnet(ip) else 1,                  # 同网段优先
-                ip,
-            ))[0]
+            # 与消息/未读归位用同一套代表 IP 选法，保证列表项与消息落点一致
+            return self._canonical_ip(ips[0])
 
         rep_ips = [pick_rep(ips) for ips in groups.values()]
 
@@ -6061,7 +6075,7 @@ class MainWindow(QMainWindow):
             ip: (
                 self.online.get(ip, {}).get("name") or self.known.get(ip, {}).get("name", ip),
                 self.online.get(ip, {}).get("online", False),
-                self.unread.get(ip, 0),
+                self.unread.get(self._device_key(ip), 0),
                 len(self.offline_queue.get(ip, [])),
             )
             for ip in sorted_ips
@@ -6094,8 +6108,9 @@ class MainWindow(QMainWindow):
         ip = cur.data(Qt.ItemDataRole.UserRole)
         self.current_ip = ip
         self.right.setCurrentIndex(1)
-        if self.unread.get(ip):
-            self.unread[ip] = 0
+        dk = self._device_key(ip)
+        if self.unread.get(dk):
+            self.unread[dk] = 0
             self._peer_list_state = {}
             self._rebuild_peer_list()
             self._update_title_unread()
@@ -6137,9 +6152,17 @@ class MainWindow(QMainWindow):
                 w.deleteLater()
 
     def _render_session(self, ip):
-        """只渲染本次程序运行期间与该设备的消息(新打开对话框是空的)。"""
+        """只渲染本次程序运行期间与该设备的消息(新打开对话框是空的)。
+        按设备(而非单个 IP)聚合：对端换 IP/多网段时，分散落在不同 IP 下的
+        本次会话消息也能合并显示，按全局序号还原先后顺序。"""
         self._clear_chat_canvas()
-        for m in self.session.get(ip, []):
+        key = self._device_key(ip)
+        msgs = []
+        for k, lst in self.session.items():
+            if self._device_key(k) == key:
+                msgs.extend(lst)
+        msgs.sort(key=lambda m: m.get("seq", 0))
+        for m in msgs:
             self._add_bubble_widget(m)
         QTimer.singleShot(30, self._scroll_bottom)
 
@@ -6163,8 +6186,9 @@ class MainWindow(QMainWindow):
         sb.setValue(sb.maximum())
 
     def _store_msg(self, ip, kind, payload, mine, name, pending=False, msg_id=None):
+        self._msg_seq += 1
         rec = {"kind": kind, "payload": payload, "mine": mine,
-               "ts": now_hm(), "name": name,
+               "ts": now_hm(), "name": name, "seq": self._msg_seq,
                "day": datetime.now().strftime("%Y-%m-%d")}
         if pending:
             rec["pending"] = True
@@ -6177,12 +6201,21 @@ class MainWindow(QMainWindow):
 
     # ---------- 收消息 ----------
     def _on_chat_in(self, sender_name, sender_ip, kind, payload):
-        # 记录设备
-        if sender_ip not in self.known:
-            self.known[sender_ip] = {"name": sender_name}
+        # 记录/更新设备(带上 uid，便于把同一台机器的多个 IP 归并成一台)
+        uid = self.online.get(sender_ip, {}).get("uid")
+        entry = self.known.get(sender_ip)
+        if (entry is None or entry.get("name") != sender_name
+                or (uid and entry.get("uid") != uid)):
+            new_entry = {"name": sender_name}
+            if uid:
+                new_entry["uid"] = uid
+            self.known[sender_ip] = new_entry
             self._save_devices()
             self._peer_list_state = {}
             self._rebuild_peer_list()
+
+        # 把来源 IP 归一到设备代表 IP：对端换 IP/跨网段时，消息仍落进同一聊天
+        cip = self._canonical_ip(sender_ip)
 
         # 待确认接收: 暂存起来，不加入聊天气泡
         if kind == "batch_staged":
@@ -6190,26 +6223,27 @@ class MainWindow(QMainWindow):
                 parts = json.loads(payload)
             except Exception:
                 parts = []
-            self.staged_receives.setdefault(sender_ip, []).append({
+            self.staged_receives.setdefault(cip, []).append({
                 "name": sender_name, "parts": parts, "ts": now_hm()
             })
             self._update_staged_banner()
             self._notify(sender_name, sender_ip, "batch", payload)
             return
 
-        rec = self._store_msg(sender_ip, kind, payload, False, sender_name)
+        rec = self._store_msg(cip, kind, payload, False, sender_name)
 
         # 是否处于"已看到"状态: 当前正打开该设备聊天 且 窗口处于激活前台
         active = self.isActiveWindow() and not self.isMinimized()
-        looking = (self.current_ip == sender_ip) and active
+        looking = (self.current_ip == cip) and active
 
-        if self.current_ip == sender_ip:
+        if self.current_ip == cip:
             self._add_bubble_widget(rec)
             QTimer.singleShot(20, self._scroll_bottom)
 
         if not looking:
-            # 累加未读, 触发各种提示
-            self.unread[sender_ip] = self.unread.get(sender_ip, 0) + 1
+            # 累加未读(按设备归并, 不随对端换 IP 而漏算/不清), 触发各种提示
+            dk = self._device_key(cip)
+            self.unread[dk] = self.unread.get(dk, 0) + 1
             self._peer_list_state = {}
             self._rebuild_peer_list()
             self._update_title_unread()
@@ -7026,8 +7060,9 @@ class MainWindow(QMainWindow):
         from PyQt6.QtCore import QEvent
         if event.type() in (QEvent.Type.ActivationChange, QEvent.Type.WindowStateChange):
             if self.isActiveWindow() and not self.isMinimized() and self.current_ip:
-                if self.unread.get(self.current_ip):
-                    self.unread[self.current_ip] = 0
+                dk = self._device_key(self.current_ip)
+                if self.unread.get(dk):
+                    self.unread[dk] = 0
                     self._peer_list_state = {}
                     self._rebuild_peer_list()
                     self._update_title_unread()
