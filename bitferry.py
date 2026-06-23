@@ -53,7 +53,7 @@ TRANSFER_PORT = 50809
 
 # ---------- 版本 / 在线更新 ----------
 # 发版时同步修改此处与 bitferry.spec 里的 CFBundleShortVersionString。
-__version__ = "1.1.12"
+__version__ = "1.1.13"
 GITHUB_REPO = "GloryTune/BitFerry"
 GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases/latest"
 # 检查更新走仓库里的 version.json(经 raw CDN, 不受 api.github.com 60次/小时限流);
@@ -69,7 +69,8 @@ CHUNK = 64 * 1024
 COMMIT = b"\xa5"
 HANDSHAKE_TIMEOUT = 30.0        # 握手阶段(MAGIC+长度+头部)最长等待秒数，挡住连上不发数据的连接
 DATA_TIMEOUT = 600.0           # 数据阶段两次收到数据之间的最长间隔秒数；发送方暂停超过它会被判为中断
-MAX_HEADER = 64 * 1024 * 1024  # 头部 JSON 最大字节数，防止超大长度前缀一次性撑爆内存
+MAX_HEADER = 8 * 1024 * 1024   # 头部 JSON 最大字节数(够容纳几万文件的批量清单)，防止超大长度前缀撑爆内存
+MAX_CONNS = 16                 # 同时处理的入站连接上限，挡住失控/异常连接耗尽内存与线程
 
 # 配置/历史/聊天图片 固定放在应用数据目录, 不随接收目录移动
 def _app_data_dir():
@@ -630,7 +631,22 @@ def get_hostname():
 
 def safe_folder_name(name):
     bad = '<>:"/\\|?*'
-    return "".join("_" if c in bad else c for c in name).strip() or "Unknown"
+    cleaned = "".join("_" if (c in bad or ord(c) < 32) else c
+                      for c in str(name)).strip()
+    # 拒绝目录穿越段：. / .. / 仅由点组成的名字会让落盘跳出接收根目录
+    if cleaned in ("", ".", "..") or set(cleaned) <= {"."}:
+        return "Unknown"
+    return cleaned
+
+
+def dest_within_root(dest, root):
+    """落盘前最后一道闸：解析后的 dest 必须仍在 root 之内，否则视为越界。"""
+    try:
+        root_r = Path(root).resolve(strict=False)
+        dest_r = Path(dest).resolve(strict=False)
+        return os.path.commonpath([str(dest_r), str(root_r)]) == str(root_r)
+    except Exception:
+        return False
 
 
 def safe_relpath(rel):
@@ -2808,6 +2824,7 @@ class Receiver:
         self.on_recv_cancelled = on_recv_cancelled  # (recv_id)
         self.on_peer_seen = on_peer_seen   # (sender_ip, name, uid, port) 入站连接即在线
         self.running = True
+        self._conn_sem = threading.Semaphore(MAX_CONNS)  # 限制并发连接数
 
     def start(self):
         threading.Thread(target=self._serve, daemon=True).start()
@@ -2831,6 +2848,14 @@ class Receiver:
             except socket.timeout:
                 continue
             except Exception:
+                continue
+            # 并发已满则直接拒收该连接，避免无上限地起线程/堆内存
+            if not self._conn_sem.acquire(blocking=False):
+                self.on_log(f"并发连接已达上限({MAX_CONNS})，拒收来自 {addr[0]}", "error")
+                try:
+                    conn.close()
+                except Exception:
+                    pass
                 continue
             threading.Thread(target=self._handle, args=(conn, addr),
                              daemon=True).start()
@@ -2904,6 +2929,11 @@ class Receiver:
                 while dest.exists():
                     dest = dest_dir / f"{b}_{i}{e}"
                     i += 1
+                # 落盘前再校验一次最终路径仍在接收根目录内（与批量分支一致，纵深防御）
+                root = TEMP_RECV_DIR if confirm else globals()["RECV_ROOT"]
+                if not dest_within_root(dest, root):
+                    self.on_log(f"拒收越界路径，来自 {sender}", "error")
+                    return
 
             t_start = time.time()
             try:
@@ -2919,6 +2949,13 @@ class Receiver:
                 if self.on_recv_cancelled and size > 0:
                     self.on_recv_cancelled(single_recv_id)
                 return
+            except Exception:
+                # 磁盘满/权限错等异常：清理半截文件，再上抛给外层统一记录
+                try:
+                    Path(dest).unlink(missing_ok=True)
+                except Exception:
+                    pass
+                raise
 
             if self.on_recv_done and size > 0:
                 self.on_recv_done(single_recv_id)
@@ -2940,6 +2977,7 @@ class Receiver:
             self.on_log(f"接收失败: {e}", "error")
         finally:
             conn.close()
+            self._conn_sem.release()
 
     def _handle_batch(self, conn, header, sender, sender_ip):
         """接收一批消息: header.parts 描述每个部件, 之后是各二进制负载顺序拼接。"""
