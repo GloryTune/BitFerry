@@ -53,7 +53,7 @@ TRANSFER_PORT = 50809
 
 # ---------- 版本 / 在线更新 ----------
 # 发版时同步修改此处与 bitferry.spec 里的 CFBundleShortVersionString。
-__version__ = "1.1.15"
+__version__ = "1.1.16"
 GITHUB_REPO = "GloryTune/BitFerry"
 GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases/latest"
 # 检查更新走仓库里的 version.json(经 raw CDN, 不受 api.github.com 60次/小时限流);
@@ -2712,6 +2712,7 @@ class Discovery:
         with self.lock:
             p = self.peers.get(ip, {})
             p["last"] = time.time()
+            p["inbound"] = time.time()   # 对方真的连上过我方 = 这个 IP 确实可达
             p["name"] = name or p.get("name", ip)
             p["port"] = port or p.get("port", TRANSFER_PORT)
             if uid:
@@ -2764,16 +2765,24 @@ class Discovery:
                 info = json.loads(data.decode("utf-8"))
                 if info.get("type") != "announce":
                     continue
-                ip = info.get("ip", addr[0])
+                # 用数据包真实源地址 addr[0] 作为对端地址：多网卡/VPN 的机器
+                # 自报的 info["ip"] 可能是错网卡(连不上)，导致我方往一个不可达地址
+                # 发送；addr[0] 是这台机器实际可达的来源地址，回连一定通。仅当源
+                # 地址异常时才回退到自报值。
+                ip = addr[0]
+                if not ip or ip.startswith("127.") or ip == "0.0.0.0":
+                    ip = info.get("ip", ip)
                 if ip in self._all_ips():   # 过滤自身所有 IP（含 VPN IP）
                     continue
                 with self.lock:
-                    self.peers[ip] = {
+                    p = self.peers.get(ip, {})
+                    p.update({
                         "name": info.get("name", ip),
                         "port": info.get("port", TRANSFER_PORT),
                         "uid": info.get("uid"),
                         "last": time.time(),
-                    }
+                    })
+                    self.peers[ip] = p
                 self.on_peers_change(self.snapshot())
                 threading.Thread(target=self._unicast_reply, args=(ip,),
                                  daemon=True).start()
@@ -2805,6 +2814,7 @@ class Discovery:
                     "name": p["name"], "port": p["port"],
                     "uid": p.get("uid"),
                     "online": (now - p["last"]) <= PEER_TIMEOUT,
+                    "inbound": p.get("inbound", 0),
                 }
             return out
 
@@ -6033,14 +6043,18 @@ class MainWindow(QMainWindow):
         key = self._device_key(ip)
         same = [k for k in (set(self.known) | set(self.online) | {ip})
                 if self._device_key(k) == key]
-        # 正在打开的同设备聊天优先，避免气泡/选中态跳走
-        if self.current_ip in same:
-            return self.current_ip
-        return sorted(same, key=lambda k: (
-            0 if self.online.get(k, {}).get("online") else 1,  # 在线优先
-            0 if self._same_subnet(k) else 1,                  # 同网段优先
-            k,
-        ))[0]
+
+        def rank(k):
+            o = self.online.get(k, {})
+            return (
+                0 if o.get("online") else 1,        # 在线优先
+                0 if o.get("inbound") else 1,        # 实际连上过我方(确认可达)优先
+                0 if k == self.current_ip else 1,    # 其次保持当前选中，减少跳动
+                0 if self._same_subnet(k) else 1,    # 同网段优先
+                k,
+            )
+        # 不再无条件钉住 current_ip：若它连不上(只在线不可达)，让位给已验证可达的 IP
+        return sorted(same, key=rank)[0]
 
     def _same_subnet(self, ip):
         try:
@@ -6095,7 +6109,9 @@ class MainWindow(QMainWindow):
             item.setSizeHint(QSize(0, 56))
             self.peer_list.addItem(item)
             self.peer_list.setItemWidget(item, PeerItem(name, ip, online, unread, queued))
-            if ip == prev:
+            # 按设备(而非具体 IP)保持选中：对端代表 IP 变化时，选中态随之迁移到
+            # 新的可达 IP，setCurrentItem 会触发 _on_peer_selected 更新 current_ip。
+            if prev and self._device_key(ip) == self._device_key(prev):
                 select_item = item
         self.peer_list.blockSignals(False)
         if select_item:
