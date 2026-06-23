@@ -53,7 +53,7 @@ TRANSFER_PORT = 50809
 
 # ---------- 版本 / 在线更新 ----------
 # 发版时同步修改此处与 bitferry.spec 里的 CFBundleShortVersionString。
-__version__ = "1.1.13"
+__version__ = "1.1.14"
 GITHUB_REPO = "GloryTune/BitFerry"
 GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases/latest"
 # 检查更新走仓库里的 version.json(经 raw CDN, 不受 api.github.com 60次/小时限流);
@@ -3390,8 +3390,9 @@ class Signals(QObject):
     win_hide = pyqtSignal()                       # 截图前隐藏窗口(主线程)
     win_show = pyqtSignal()                       # 截图后恢复窗口(主线程)
     recv_started  = pyqtSignal(str, str, str, str)          # recv_id, sender_name, sender_ip, meta_json
-    recv_progress = pyqtSignal(str, str, int, int, float)   # recv_id, filename, done, total, speed_bps
-    send_unit_progress = pyqtSignal(str, int, int, float)  # unit_id, done, total, speed
+    # done/total 用 qint64：Qt 的 int 是 32 位(上限~2.1GB)，几个 G 的传输会溢出成负数
+    recv_progress = pyqtSignal(str, str, 'qint64', 'qint64', float)   # recv_id, filename, done, total, speed_bps
+    send_unit_progress = pyqtSignal(str, 'qint64', 'qint64', float)  # unit_id, done, total, speed
     send_unit_result = pyqtSignal(str, str, str)           # unit_id, status(ok/cancelled/error), reason
     recv_done = pyqtSignal(str)                             # recv_id
     recv_cancelled = pyqtSignal(str)                        # recv_id — 发送方取消传输
@@ -4575,7 +4576,7 @@ class TransferRow(QFrame):
 
     def set_progress(self, done, total, speed):
         if total > 0:
-            pct = min(100, int(done * 100 / total))
+            pct = max(0, min(100, int(done * 100 / total)))
             self.bar.setValue(pct)
             self.pct_lbl.setText(f"{pct}%")
         self.speed_lbl.setText(_human_speed(speed))
