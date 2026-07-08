@@ -18,6 +18,8 @@ a = Analysis(
         'PyQt6.sip',
         # 在线更新 HTTPS 校验用的 CA 证书库
         'certifi',
+        # 手机网页版二维码(纯 Python, 不依赖 PIL)
+        'qrcode',
         # macOS: Dock 图标点击激活窗口 + 屏幕录制权限检查
         'AppKit',
         'Quartz',
@@ -77,8 +79,8 @@ app = BUNDLE(
         'NSHighResolutionCapable': True,
         'NSRequiresAquaSystemAppearance': False,
         'CFBundleDisplayName': 'BitFerry',
-        'CFBundleShortVersionString': '1.1.12',
-        'CFBundleVersion': '1.1.12',
+        'CFBundleShortVersionString': '1.1.17',
+        'CFBundleVersion': '1.1.17',
         'NSLocalNetworkUsageDescription': 'BitFerry 需要访问局域网以发现并连接设备。',
         'NSScreenCaptureUsageDescription': 'BitFerry 需要屏幕录制权限以进行区域截图。',
         'NSBluetoothAlwaysUsageDescription': '',

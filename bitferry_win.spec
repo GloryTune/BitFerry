@@ -16,6 +16,8 @@ a = Analysis(
         'PyQt6.sip',
         # 在线更新 HTTPS 校验用的 CA 证书库
         'certifi',
+        # 手机网页版二维码(纯 Python, 不依赖 PIL)
+        'qrcode',
     ],
     hookspath=[],
     hooksconfig={},
