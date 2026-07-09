@@ -49,6 +49,7 @@ from PyQt6.QtWidgets import (
     QStackedWidget, QSpacerItem, QSystemTrayIcon, QMenu, QDialog, QLineEdit,
     QProgressBar, QRadioButton, QButtonGroup, QToolButton, QCheckBox,
 )
+from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 
 try:
     import qrcode          # 可选: 手机网页版二维码 (pip install qrcode)
@@ -63,7 +64,7 @@ TRANSFER_PORT = 50809
 
 # ---------- 版本 / 在线更新 ----------
 # 发版时同步修改此处与 bitferry.spec 里的 CFBundleShortVersionString。
-__version__ = "1.1.17"
+__version__ = "1.1.18"
 GITHUB_REPO = "GloryTune/BitFerry"
 GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases/latest"
 # 检查更新走仓库里的 version.json(经 raw CDN, 不受 api.github.com 60次/小时限流);
@@ -107,15 +108,47 @@ OFFLINE_QUEUE_FILE = APP_DATA / "offline_queue.json"
 TEMP_RECV_DIR = APP_DATA / "temp_recv"
 
 
-def load_recv_root():
-    """从设置读取接收目录, 没有则用默认。"""
+def _log_persist_error(what, exc):
+    """持久化失败不再静默：至少打到 stderr，便于排查磁盘满 / 权限 / 文件损坏问题。"""
     try:
-        s = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-        p = s.get("recv_root")
-        if p:
-            return Path(p)
+        print(f"[BitFerry] {what} 失败: {exc}", file=sys.stderr)
     except Exception:
         pass
+
+
+def _read_json_file(path, default):
+    """读 JSON：文件不存在返回默认值；内容损坏则先把坏文件备份成
+    <名字>.corrupt-<时间戳> 再返回默认值——避免下次写入直接覆盖、导致
+    聊天记录 / 设备列表被静默清空且无法事后恢复。"""
+    path = Path(path)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return default
+    except Exception as e:
+        _log_persist_error(f"读取 {path.name}", e)
+        return default
+    try:
+        return json.loads(text)
+    except Exception as e:
+        try:
+            bak = path.with_name(f"{path.name}.corrupt-{int(time.time())}")
+            path.replace(bak)
+            try:
+                print(f"[BitFerry] {path.name} 内容损坏({e})，已备份为 {bak.name}",
+                      file=sys.stderr)
+            except Exception:
+                pass
+        except Exception as e2:
+            _log_persist_error(f"备份损坏的 {path.name}", e2)
+        return default
+
+
+def load_recv_root():
+    """从设置读取接收目录, 没有则用默认。"""
+    p = _read_settings().get("recv_root")
+    if p:
+        return Path(p)
     return DEFAULT_RECV_ROOT
 
 
@@ -129,10 +162,8 @@ DEFAULT_SHORTCUT = "Alt+Shift+A"
 
 
 def _read_settings():
-    try:
-        return json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    s = _read_json_file(SETTINGS_FILE, {})
+    return s if isinstance(s, dict) else {}
 
 
 def set_setting(key, value):
@@ -141,8 +172,8 @@ def set_setting(key, value):
         s = _read_settings()
         s[key] = value
         SETTINGS_FILE.write_text(json.dumps(s, ensure_ascii=False), encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as e:
+        _log_persist_error(f"保存设置 {key}", e)
 
 
 def get_setting(key, default=None):
@@ -236,18 +267,16 @@ def set_autostart(enabled: bool):
 
 
 def load_offline_queue():
-    try:
-        return json.loads(OFFLINE_QUEUE_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    q = _read_json_file(OFFLINE_QUEUE_FILE, {})
+    return q if isinstance(q, dict) else {}
 
 
 def save_offline_queue(q):
     try:
         APP_DATA.mkdir(parents=True, exist_ok=True)
         OFFLINE_QUEUE_FILE.write_text(json.dumps(q, ensure_ascii=False), encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as e:
+        _log_persist_error("保存离线队列", e)
 
 
 ACCENT = "#5B8CFF"   # 运行时由 _set_theme 更新
@@ -3408,6 +3437,7 @@ class TransferControl:
 
 _WEB_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 _WEB_ONLINE_GRACE = 12.0     # SSE 断开后仍视为在线的宽限秒数(EventSource 会自动重连)
+_WEB_MAX_DOWNLOADS = 500     # 桌面→手机下载链接的登记上限, 超出丢弃最旧的, 防止长期运行内存无限增长
 
 WEB_PAGE_HTML = r'''<!doctype html>
 <html lang="zh">
@@ -3829,6 +3859,11 @@ class WebBridge:
         fid = uuid.uuid4().hex[:10]
         with self.lock:
             self.downloads[fid] = str(path)
+            # 超出上限时丢弃最旧的登记项(dict 保序): 老链接失效可接受,
+            # 手机极少回头去下载很久以前的文件, 换来内存不再无限增长。
+            if len(self.downloads) > _WEB_MAX_DOWNLOADS:
+                for old in list(self.downloads)[:-_WEB_MAX_DOWNLOADS]:
+                    self.downloads.pop(old, None)
         return fid
 
     def get_download(self, fid):
@@ -6463,30 +6498,26 @@ class MainWindow(QMainWindow):
 
     # ---------- 持久化 ----------
     def _load_history(self):
-        try:
-            return json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
+        h = _read_json_file(HISTORY_FILE, {})
+        return h if isinstance(h, dict) else {}
 
     def _save_history(self):
         try:
             HISTORY_FILE.write_text(
                 json.dumps(self.history, ensure_ascii=False), encoding="utf-8")
-        except Exception:
-            pass
+        except Exception as e:
+            _log_persist_error("保存聊天记录", e)
 
     def _load_devices(self):
-        try:
-            return json.loads(DEVICES_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
+        d = _read_json_file(DEVICES_FILE, {})
+        return d if isinstance(d, dict) else {}
 
     def _save_devices(self):
         try:
             DEVICES_FILE.write_text(
                 json.dumps(self.known, ensure_ascii=False), encoding="utf-8")
-        except Exception:
-            pass
+        except Exception as e:
+            _log_persist_error("保存设备列表", e)
 
     # ---------- UI ----------
     def _build_ui(self):
@@ -8266,15 +8297,52 @@ def apply_update_windows(new_exe_path):
     subprocess.Popen(["cmd", "/c", str(bat)], creationflags=flags)
 
 
+_SINGLE_INSTANCE_KEY = "BitFerry-single-instance"
+
+
 def main():
-    _try_open_win_firewall()
     app = QApplication(sys.argv)
     app.setApplicationName("BitFerry")
+
+    # ---- 单实例保护 ----
+    # 先尝试连上已运行实例的本地服务：连得上说明已有一个 BitFerry 在跑，
+    # 就请它把窗口带到前台，然后本进程直接退出(不再抢占 50808/50809/50810 端口，
+    # 避免第二个实例静默地收不到文件)。
+    probe = QLocalSocket()
+    probe.connectToServer(_SINGLE_INSTANCE_KEY)
+    if probe.waitForConnected(300):
+        try:
+            probe.write(b"raise")
+            probe.flush()
+            probe.waitForBytesWritten(300)
+        finally:
+            probe.disconnectFromServer()
+        QMessageBox.information(None, "BitFerry",
+                               "BitFerry 已在运行。\n已为你唤出正在运行的窗口。")
+        return
+    probe.abort()
+
+    # 没连上：可能确实没在跑，也可能上次崩溃残留了 socket 文件，先清理再监听。
+    QLocalServer.removeServer(_SINGLE_INSTANCE_KEY)
+    server = QLocalServer()
+    server.listen(_SINGLE_INSTANCE_KEY)
+
+    _try_open_win_firewall()
     f = QFont()
     f.setFamily("PingFang SC" if platform.system() == "Darwin" else "Microsoft YaHei UI")
     f.setPointSize(13 if platform.system() == "Darwin" else 10)
     app.setFont(f)
     win = MainWindow()
+
+    def _on_second_instance():
+        conn = server.nextPendingConnection()
+        if conn is not None:
+            conn.readAll()   # 读掉 "raise"，无需解析
+            win._bring_to_front()
+            conn.disconnectFromServer()
+    server.newConnection.connect(_on_second_instance)
+    win._instance_server = server   # 持引用，防止被 GC 关掉监听
+
     win.show()
     sys.exit(app.exec())
 
