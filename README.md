@@ -309,12 +309,18 @@ MIT License
 - 记录版本和平台、启动退出、重复启动唤起、任务创建/重试/撤销/结果、接收处理、设备和设置变更、缓存清理、持久化错误和未捕获异常等诊断信息。包含任务 ID、设备身份、文件相关信息及失败原因；不记录聊天正文，连接 URL 中的口令参数会脱敏。
 - 「日志与存储」显示当前运行的最近日志，可筛选错误与警告，并导出最近 7 天日志 ZIP。日志保存失败也会出现在最近错误中。
 
-### Windows 补充发布 1.2
+### 2.0 发送确认与接收修复
 
-拉取 `main` 最新代码后，在 Windows 上按上述命令构建。安装包上传到已有的 `v1.2` Release：
+- 设备发现广播声明本机会发送接收回执。对未声明的旧版本设备（1.2 及更早），数据发完后对方正常断开即视为已接收；超时或连接被重置仍标记为未确认。
+- 侧栏「待发」只统计仍会自动发送的任务，已送达、已撤销和未确认的任务不计入。
+- 修复 Windows 上并发接收同名文件时，路径解析偶发保留 `\\?\` 前缀导致误判越界拒收。
 
-```powershell
-gh release upload v1.2 .\dist\BitFerry-windows-x64.exe --repo GloryTune/BitFerry
+### 发布 2.0
+
+Windows 包已上传到 `v2.0` Release，`version.json` 目前只列出 Windows 文件。macOS 包在 Mac 上构建后上传：
+
+```bash
+gh release upload v2.0 BitFerry-macos-arm64.zip --repo GloryTune/BitFerry
 ```
 
-上传完成后，在 `version.json` 的 `assets` 中加入 `"windows": "BitFerry-windows-x64.exe"`，提交并推送到 `main`，再核对 Release 下载链接。macOS 包先发布期间，更新清单不提供尚未上传的 Windows 文件。
+上传完成后，在 `version.json` 的 `assets` 中加入 `"darwin": "BitFerry-macos-arm64.zip"`，提交并推送到 `main`，再核对 Release 下载链接。更新清单不提供尚未上传的文件。

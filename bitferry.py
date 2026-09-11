@@ -67,7 +67,7 @@ TRANSFER_PORT = 50809
 
 # ---------- 版本 / 在线更新 ----------
 # 发版时同步修改此处与 bitferry.spec 里的 CFBundleShortVersionString。
-__version__ = "1.2"
+__version__ = "2.0"
 GITHUB_REPO = "GloryTune/BitFerry"
 GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases/latest"
 # 检查更新走仓库里的 version.json(经 raw CDN, 不受 api.github.com 60次/小时限流);
