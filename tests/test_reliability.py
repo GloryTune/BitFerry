@@ -133,7 +133,10 @@ class ReceiveTests(unittest.TestCase):
         outside = self.root / 'outside'
         outside.mkdir()
         app.RECV_ROOT.mkdir()
-        (app.RECV_ROOT / 'peer').symlink_to(outside, target_is_directory=True)
+        try:
+            (app.RECV_ROOT / 'peer').symlink_to(outside, target_is_directory=True)
+        except OSError as e:
+            self.skipTest(f'cannot create symlink: {e}')
         with self.assertRaises(ValueError):
             self.receive()
         self.assertEqual(list(outside.iterdir()), [])
@@ -251,6 +254,34 @@ class SenderTests(unittest.TestCase):
             with patch.object(app.socket, 'socket', return_value=client), patch.object(app, '_my_uid', return_value='me'):
                 self.assertEqual(app.send_batch([{'type': 'text', 'text': 'hello'}], 'ip', 1, 'me', Mock()), 'unconfirmed')
             client.close.assert_called()
+
+    def test_legacy_peer_clean_close_after_commit_is_success(self):
+        client = Mock()
+        client.recv.return_value = b''
+        with patch.object(app.socket, 'socket', return_value=client), patch.object(app, '_my_uid', return_value='me'):
+            self.assertEqual(app.send_batch([{'type': 'text', 'text': 'hello'}], 'ip', 1, 'me', Mock(), peer_acks=False), 'ok')
+
+    def test_legacy_peer_reset_or_timeout_is_still_unconfirmed(self):
+        for failure in (ConnectionResetError(), socket.timeout()):
+            client = Mock()
+            client.recv.side_effect = failure
+            with patch.object(app.socket, 'socket', return_value=client), patch.object(app, '_my_uid', return_value='me'):
+                self.assertEqual(app.send_batch([{'type': 'text', 'text': 'hello'}], 'ip', 1, 'me', Mock(), peer_acks=False), 'unconfirmed')
+
+    def test_announce_declares_receipt_ack(self):
+        msg = json.loads(app.Discovery._make_msg(SimpleNamespace(hostname='h', uid='u'), '1.2.3.4'))
+        self.assertEqual(msg['acks'], 1)
+
+    def test_queued_count_ignores_delivered_and_unconfirmed(self):
+        text = [{'type': 'text', 'text': 'hi'}]
+        w = SimpleNamespace(offline_queue={'ip': [
+            {'text_items': text, 'text_status': 'unconfirmed', 'file_units': []},
+            {'text_items': text, 'text_status': 'ok', 'file_units': [{'status': 'unconfirmed'}]},
+            {'text_items': text, 'file_units': []},
+            {'text_items': [], 'file_units': [{'status': 'error'}]},
+            {'send_items': text},
+        ]})
+        self.assertEqual(app.MainWindow._queued_count(w, 'ip'), 3)
 
     def test_connection_failure_is_error(self):
         client = Mock()
@@ -387,6 +418,7 @@ class UpdateTests(unittest.TestCase):
                 app._extract_macos_update(archive, Path(td) / 'dest')
             run.assert_not_called()
 
+    @unittest.skipIf(platform.system() == 'Windows', 'Windows has no executable permission bit')
     def test_invalid_update_executable_does_not_start_installer(self):
         with tempfile.TemporaryDirectory() as td:
             work = Path(td) / 'work'

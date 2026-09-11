@@ -774,12 +774,23 @@ def safe_folder_name(name):
     return cleaned
 
 
+def _comparable_path(path):
+    """Windows 并发建目录时 realpath 偶尔保留 \\\\?\\ 前缀，比较前统一去掉并规范大小写。"""
+    s = str(Path(path).resolve(strict=False))
+    if os.name == "nt":
+        if s.startswith("\\\\?\\UNC\\"):
+            s = "\\\\" + s[8:]
+        elif s.startswith("\\\\?\\"):
+            s = s[4:]
+    return os.path.normcase(s)
+
+
 def dest_within_root(dest, root):
     """落盘前最后一道闸：解析后的 dest 必须仍在 root 之内，否则视为越界。"""
     try:
-        root_r = Path(root).resolve(strict=False)
-        dest_r = Path(dest).resolve(strict=False)
-        return os.path.commonpath([str(dest_r), str(root_r)]) == str(root_r)
+        root_r = _comparable_path(root)
+        dest_r = _comparable_path(dest)
+        return os.path.commonpath([dest_r, root_r]) == root_r
     except Exception:
         return False
 
@@ -2960,9 +2971,10 @@ class Discovery:
     def _make_msg(self, lan_ip=None):
         if lan_ip is None:
             lan_ip = self._best_announce_ip()
+        # acks: 声明本机接收成功后一定回执；未声明的旧版对端收完只会直接断开。
         return json.dumps({
             "type": "announce", "name": self.hostname,
-            "ip": lan_ip, "port": TRANSFER_PORT, "uid": self.uid,
+            "ip": lan_ip, "port": TRANSFER_PORT, "uid": self.uid, "acks": 1,
         }).encode("utf-8")
 
     def set_receiving(self, ready):
@@ -3135,6 +3147,7 @@ class Discovery:
                         "name": info.get("name", ip),
                         "port": info.get("port", TRANSFER_PORT),
                         "uid": info.get("uid"),
+                        "acks": bool(info.get("acks")),
                         "last": time.time(),
                     })
                     self.peers[ip] = p
@@ -3168,6 +3181,7 @@ class Discovery:
                 out[ip] = {
                     "name": p["name"], "port": p["port"],
                     "uid": p.get("uid"),
+                    "acks": p.get("acks", False),
                     "online": (now - p["last"]) <= PEER_TIMEOUT,
                     "inbound": p.get("inbound", 0),
                 }
@@ -3552,12 +3566,13 @@ def send_file(filepath, peer_ip, peer_port, sender_name, on_log):
 
 def send_batch(items, peer_ip, peer_port, sender_name, on_log,
                on_progress=None, first_name="", ctrl: "TransferControl | None" = None,
-               transfer_id=None):
+               transfer_id=None, peer_acks=True):
     """
     一次性发送一批内容(文字/图片/文件)作为单个消息块。
     ctrl: TransferControl 实例，可在发送途中暂停/取消。
     on_progress(filename, done_bytes, total_bytes, speed_bps) 每 CHUNK 回调一次。
-    返回 ok / error / cancelled / unconfirmed（旧端或回执丢失）。
+    peer_acks: 对端是否声明会回执；为 False 时旧版对端收完正常断开视为成功。
+    返回 ok / error / cancelled / unconfirmed（回执丢失）。
     """
     s = None
     try:
@@ -3666,10 +3681,16 @@ def send_batch(items, peer_ip, peer_port, sender_name, on_log,
         s.sendall(COMMIT)
         s.settimeout(HANDSHAKE_TIMEOUT)
         try:
-            acknowledged = s.recv(1) == RECEIVED
+            reply = s.recv(1)
         except (OSError, ConnectionError):
-            acknowledged = False
-        if not acknowledged:
+            reply = None
+        if reply == b"" and not peer_acks:
+            # 旧版对端没有回执，读完 COMMIT 后正常断开就是它唯一的成功信号；
+            # 超时或连接被重置仍按未确认处理。
+            s.close()
+            on_log(f"对方已接收 → {peer_ip}（{len(parts)} 项，对方为旧版本，无回执）", "send")
+            return "ok"
+        if reply != RECEIVED:
             on_log("未收到接收回执：对方可能为旧版本或连接已中断，请核实对方是否收到", "error")
             s.close()
             return "unconfirmed"
@@ -7830,7 +7851,7 @@ class MainWindow(QMainWindow):
                 self.online.get(ip, {}).get("name") or self.known.get(ip, {}).get("name", ip),
                 self.online.get(ip, {}).get("online", False),
                 self.unread.get(self._device_key(ip), 0),
-                len(self.offline_queue.get(ip, [])),
+                self._queued_count(ip),
             )
             for ip in sorted_ips
         }
@@ -7946,6 +7967,22 @@ class MainWindow(QMainWindow):
 
     def _peer_port(self, ip):
         return self.online.get(ip, {}).get("port", TRANSFER_PORT)
+
+    def _peer_acks(self, ip):
+        """对端广播是否声明会发接收回执（v1.2 及更早版本不声明）。"""
+        return bool(self.online.get(ip, {}).get("acks"))
+
+    def _queued_count(self, ip):
+        """侧栏"待发"只统计仍会自动发送的任务；已送达、已撤销或待人工核实的不算。"""
+        settled = ("ok", "offered", "unconfirmed", "cancelled")
+        count = 0
+        for entry in self.offline_queue.get(ip, []):
+            if "text_items" not in entry and "file_units" not in entry:
+                count += 1          # 旧格式条目，尚未补发
+            elif (entry.get("text_items") and entry.get("text_status") not in settled) or \
+                    any(u.get("status") not in settled for u in entry.get("file_units", [])):
+                count += 1
+        return count
 
     def _refresh_header(self):
         ip = self.current_ip
@@ -8527,6 +8564,7 @@ class MainWindow(QMainWindow):
 
         target_ip = target_ip or self._canonical_ip(ip)
         control = self._text_controls[msg_id]
+        peer_acks = self._peer_acks(target_ip)
         def do():
             errors = []
             def log(m, k="send"):
@@ -8534,7 +8572,7 @@ class MainWindow(QMainWindow):
                     errors.append(m)
                 self.signals.log.emit(m, k)
             status = send_batch(text_items, target_ip, port, self.hostname, log,
-                                ctrl=control, transfer_id=msg_id)
+                                ctrl=control, transfer_id=msg_id, peer_acks=peer_acks)
             self.signals.text_result.emit(ip, msg_id, status, errors[-1] if errors else "", queue_id)
         threading.Thread(target=do, daemon=True).start()
 
@@ -8586,6 +8624,7 @@ class MainWindow(QMainWindow):
             units.append((uid, u["send_items"]))
 
         target_ip = target_ip or self._canonical_ip(ip)
+        peer_acks = self._peer_acks(target_ip)
         def worker():
             for uid, sitems in units:
                 meta = self._send_units.get(uid)
@@ -8606,7 +8645,8 @@ class MainWindow(QMainWindow):
                     self.signals.send_unit_progress.emit(_uid, done, total, speed)
 
                 status = send_batch(sitems, target_ip, port, self.hostname, on_log,
-                                    on_progress=on_prog, ctrl=ctrl, transfer_id=uid)
+                                    on_progress=on_prog, ctrl=ctrl, transfer_id=uid,
+                                    peer_acks=peer_acks)
                 if status == "ok":
                     self.signals.send_unit_result.emit(uid, "ok", "")
                 elif status == "cancelled":

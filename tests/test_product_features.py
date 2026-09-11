@@ -311,7 +311,7 @@ class ProductTests(unittest.TestCase):
         node = shutil.which('node')
         if not node:
             self.skipTest('Node is only needed for the browser keyboard regression')
-        script = Path(app.__file__).read_text()
+        script = Path(app.__file__).read_text(encoding='utf-8')
         body = re.search(r"inp.addEventListener\('keydown', function\(e\)\{(.*?)\n\}\);", script, re.S).group(1)
         harness = "let sent=0; function sendText(){sent++}; function key(e){" + body + "};" + """
           const normal={key:'Enter', shiftKey:false, isComposing:false, keyCode:13, preventDefault(){}};
