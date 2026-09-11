@@ -28,6 +28,8 @@ import re
 import hmac
 import queue
 import mimetypes
+from history_store import HistoryStore
+from diagnostics import DailyLog, SerialWriter, collect_paths, cache_inventory, delete_cache_candidates
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
 from pathlib import Path
@@ -35,7 +37,7 @@ from datetime import datetime
 
 from PyQt6.QtCore import (
     Qt, QObject, pyqtSignal, QSize, QBuffer, QByteArray, QTimer, QUrl,
-    QRectF, QRect, QPoint, QPointF, QAbstractNativeEventFilter,
+    QRectF, QRect, QPoint, QPointF, QAbstractNativeEventFilter, QLockFile,
 )
 from PyQt6.QtGui import (
     QFont, QPixmap, QImage, QKeySequence, QShortcut, QTextCursor, QGuiApplication,
@@ -48,6 +50,7 @@ from PyQt6.QtWidgets import (
     QMessageBox, QPlainTextEdit, QSizePolicy, QScrollArea, QTextEdit,
     QStackedWidget, QSpacerItem, QSystemTrayIcon, QMenu, QDialog, QLineEdit,
     QProgressBar, QRadioButton, QButtonGroup, QToolButton, QCheckBox,
+    QSpinBox, QTableWidget, QTableWidgetItem, QHeaderView, QComboBox,
 )
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 
@@ -64,7 +67,7 @@ TRANSFER_PORT = 50809
 
 # ---------- 版本 / 在线更新 ----------
 # 发版时同步修改此处与 bitferry.spec 里的 CFBundleShortVersionString。
-__version__ = "1.1.18"
+__version__ = "1.2"
 GITHUB_REPO = "GloryTune/BitFerry"
 GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases/latest"
 # 检查更新走仓库里的 version.json(经 raw CDN, 不受 api.github.com 60次/小时限流);
@@ -79,6 +82,7 @@ CHUNK = 64 * 1024
 # 传输完成标记：接收方读完全部声明字节后，必须再收到这一字节才提交落盘。
 # 发送方取消时不发送它（直接关闭连接），接收方据此判定为“取消”并丢弃残缺数据。
 COMMIT = b"\xa5"
+RECEIVED = b"\xa6"            # 新版接收方提交成功后的回执；旧版没有回执
 HANDSHAKE_TIMEOUT = 30.0        # 握手阶段(MAGIC+长度+头部)最长等待秒数，挡住连上不发数据的连接
 DATA_TIMEOUT = 600.0           # 数据阶段两次收到数据之间的最长间隔秒数；发送方暂停超过它会被判为中断
 MAX_HEADER = 8 * 1024 * 1024   # 头部 JSON 最大字节数(够容纳几万文件的批量清单)，防止超大长度前缀撑爆内存
@@ -106,12 +110,16 @@ DEFAULT_RECV_ROOT = Path.home() / "BitFerry_Received"
 RECV_ROOT = DEFAULT_RECV_ROOT               # 运行时全局, 接收线程引用
 OFFLINE_QUEUE_FILE = APP_DATA / "offline_queue.json"
 TEMP_RECV_DIR = APP_DATA / "temp_recv"
+STAGED_FILE = APP_DATA / "staged_receives.json"
 
 
 def _log_persist_error(what, exc):
     """持久化失败不再静默：至少打到 stderr，便于排查磁盘满 / 权限 / 文件损坏问题。"""
     try:
         print(f"[BitFerry] {what} 失败: {exc}", file=sys.stderr)
+        sink = globals().get("_diagnostic_sink")
+        if sink:
+            sink.record("error", f"{what} 失败: {exc}")
     except Exception:
         pass
 
@@ -266,17 +274,99 @@ def set_autostart(enabled: bool):
         pass
 
 
+def _write_json_atomic(path, value):
+    tmp = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=".state-", delete=False) as f:
+            tmp = Path(f.name)
+            json.dump(value, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        return True
+    except Exception as e:
+        _log_persist_error(f"保存 {path.name}", e)
+        return False
+    finally:
+        if tmp is not None:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _safe_staged_path(path):
+    path = Path(path)
+    try:
+        rel = path.relative_to(TEMP_RECV_DIR)
+        return (len(rel.parts) >= 2 and ".." not in rel.parts
+                and dest_within_root(path, TEMP_RECV_DIR) and not path.is_symlink())
+    except ValueError:
+        return False
+
+
+def _load_staged_receives():
+    data = _read_json_file(STAGED_FILE, {})
+    result = {}
+    if not isinstance(data, dict):
+        return result
+    for ip, entries in data.items():
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            parts = [part for part in entry.get("parts", []) if isinstance(part, dict)
+                     and part.get("staged") and _safe_staged_path(part.get("path", ""))
+                     and Path(part["path"]).exists()]
+            if parts:
+                result.setdefault(ip, []).append(dict(entry, parts=parts))
+    return result
+
+
 def load_offline_queue():
     q = _read_json_file(OFFLINE_QUEUE_FILE, {})
-    return q if isinstance(q, dict) else {}
+    if not isinstance(q, dict):
+        return {}
+    q = {ip: [e for e in entries if isinstance(e, dict)] for ip, entries in q.items() if isinstance(entries, list)}
+    for entries in q.values():
+        for entry in entries:
+            entry.setdefault("msg_id", str(uuid.uuid4()))
+            if "text_items" not in entry and "file_units" not in entry:
+                entry["text_items"] = entry.get("send_items", [])
+                entry["file_units"] = []
+            if entry.get("text_status") == "sending":
+                entry["text_status"] = "unconfirmed"
+            for unit in entry.get("file_units", []):
+                unit.setdefault("transfer_id", str(uuid.uuid4()))
+                if unit.get("status") == "sending":
+                    unit["status"] = "unconfirmed"
+    return q
 
 
 def save_offline_queue(q):
+    tmp = None
     try:
         APP_DATA.mkdir(parents=True, exist_ok=True)
-        OFFLINE_QUEUE_FILE.write_text(json.dumps(q, ensure_ascii=False), encoding="utf-8")
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=APP_DATA,
+                                         prefix=".offline-", delete=False) as f:
+            tmp = Path(f.name)
+            json.dump(q, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, OFFLINE_QUEUE_FILE)
+        return True
     except Exception as e:
         _log_persist_error("保存离线队列", e)
+        return False
+    finally:
+        if tmp is not None:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 ACCENT = "#5B8CFF"   # 运行时由 _set_theme 更新
@@ -464,6 +554,10 @@ def build_style(t: dict) -> str:
     return _STYLE_TPL.format(**t)
 
 _STYLE_TPL = (
+    "QDialog {{ background:{s1}; color:{t1}; }}\n"
+    "QDialog QLabel, QDialog QCheckBox, QDialog QRadioButton {{ color:{t1}; }}\n"
+    "#settingsContent, #settingsScroll {{ background:{s1}; color:{t1}; }}\n"
+    "#settingsContent QLabel#selfLabel {{ color:{t2}; }}\n"
     # 主窗口 — 深色主题用纯色，浅色主题用微渐变
     "QMainWindow, #root {{ background: {win_bg}; }}\n"
     "#sidebar {{ background: {sidebar_bg}; border-right: 2px solid {sidebar_border}; }}\n"
@@ -691,17 +785,47 @@ def dest_within_root(dest, root):
 
 
 def safe_relpath(rel):
-    """把发送方提供的相对路径净化为安全子路径：剔除 .. / 绝对路径 / 盘符 / 非法字符，
-    防止目录穿越写到接收根目录之外。无法净化出有效路径时返回 None。"""
+    """拒绝上级目录、绝对路径和盘符，其余路径段统一净化后用于写盘和卡片。"""
     if not rel:
         return None
+    raw = str(rel).replace("\\", "/")
+    if raw.startswith("/") or re.match(r"^[A-Za-z]:", raw):
+        raise ValueError("拒收绝对路径")
     parts = []
-    for seg in str(rel).replace("\\", "/").split("/"):
-        seg = "".join("_" if c in '<>:"|?*' else c for c in seg.strip())
-        if seg in ("", ".", ".."):
+    for seg in raw.split("/"):
+        if seg.strip() == "..":
+            raise ValueError("拒收包含上级目录的路径")
+        if seg in ("", "."):
             continue
-        parts.append(seg)
+        parts.append(safe_folder_name(seg))
     return "/".join(parts) or None
+
+
+def _reserve_recv_path(parent, name, root, directory=False):
+    """排他创建新目标，避免同名传输和并发传输覆盖已有文件。"""
+    parent = Path(parent)
+    if not dest_within_root(parent, root):
+        raise ValueError("拒收越界路径")
+    parent.mkdir(parents=True, exist_ok=True)
+    name = safe_folder_name(name)
+    base, ext = (name, "") if directory else os.path.splitext(name)
+    i = 0
+    while True:
+        dest = parent / (name if i == 0 else f"{base}_{i}{ext}")
+        if dest.is_symlink():
+            i += 1
+            continue
+        if not dest_within_root(dest, root):
+            raise ValueError("拒收越界路径")
+        try:
+            if directory:
+                dest.mkdir()
+            else:
+                with open(dest, "xb"):
+                    pass
+            return dest
+        except FileExistsError:
+            i += 1
 
 
 def recv_exact(sock, n):
@@ -978,7 +1102,8 @@ def _draw_annotation(p: QPainter, ann: "_Annotation"):
             p.setFont(f)
             p.setPen(ann.color)
             fm = QFontMetrics(f)
-            p.drawText(QPoint(ann.p1.x() + 3, ann.p1.y() + fm.ascent() + 3), ann.text)
+            for line, text in enumerate(ann.text.split("\n")):
+                p.drawText(QPoint(ann.p1.x() + 3, ann.p1.y() + fm.ascent() + 3 + line * fm.lineSpacing()), text)
 
 
 def _pt_seg_dist(p: QPoint, a: QPoint, b: QPoint) -> float:
@@ -1001,8 +1126,9 @@ def _ann_bounds(ann: "_Annotation") -> QRect:
         return QRect(QPoint(min(xs), min(ys)), QPoint(max(xs), max(ys)))
     if ann.kind == "text":
         fm = QFontMetrics(ann.font or QFont())
-        w = fm.horizontalAdvance(ann.text) + 6
-        h = fm.height() + 6
+        lines = ann.text.split("\n")
+        w = max((fm.horizontalAdvance(line) for line in lines), default=0) + 6
+        h = fm.height() + (len(lines) - 1) * fm.lineSpacing() + 6
         return QRect(ann.p1, QSize(w, h))
     return QRect(ann.p1, ann.p2).normalized()
 
@@ -1381,6 +1507,140 @@ class _TextInput(QLineEdit):
         self.committed.emit(self.text())
 
 
+def _text_size_setting():
+    try:
+        return max(8, min(96, int(get_setting("annotation_text_size", 14))))
+    except (TypeError, ValueError):
+        return 14
+
+
+def _change_annotation_size(owner, size):
+    owner._text_size = size
+    set_setting("annotation_text_size", size)
+    if owner._text_edit is not None:
+        font = owner._text_edit.font()
+        font.setPointSize(size)
+        owner._text_edit.setFont(font)
+        owner._text_edit.resize(owner._text_edit.width(), owner._text_edit.sizeHint().height())
+    index = owner._selected
+    if index is not None and 0 <= index < len(owner._annotations):
+        ann = owner._annotations[index]
+        if ann.kind == "text":
+            ann.font = QFont(ann.font)
+            ann.font.setPointSizeF(size / getattr(owner, "_scale", 1.0))
+    owner.update()
+
+
+def _font_size_control(lay, owner):
+    label = QLabel("字号")
+    label.setStyleSheet("color:#E6E8EC;")
+    lay.addWidget(label)
+    spin = QSpinBox()
+    spin.setRange(8, 96)
+    spin.setValue(owner._text_size)
+    spin.setSuffix(" pt")
+    spin.setKeyboardTracking(False)
+    spin.setFixedWidth(82)
+    spin.setToolTip("设置新文字字号；选中文字后也可以调整大小")
+    spin.setStyleSheet("QSpinBox { color:#E6E8EC; background:#343945; padding:3px; }")
+    spin.valueChanged.connect(lambda value: _change_annotation_size(owner, value))
+    lay.addWidget(spin)
+    owner._font_size_spin = spin
+    return spin
+
+
+def _sync_annotation_font(owner):
+    index = owner._selected
+    spin = getattr(owner, "_font_size_spin", None)
+    if spin is None or index is None:
+        return
+    ann = owner._annotations[index]
+    if ann.kind == "text":
+        size = round(ann.font.pointSizeF() * getattr(owner, "_scale", 1.0))
+        blocked = spin.blockSignals(True)
+        spin.setValue(size)
+        spin.blockSignals(blocked)
+        owner._text_size = spin.value()
+
+
+def _save_editable_layers(path, base, annotations, offset=None, scale=1.0):
+    """Editable data stays local; the exported PNG remains an ordinary image."""
+    if not annotations:
+        return
+    path = Path(path)
+    offset = offset or QPoint()
+    def point(pt):
+        return [round((pt.x() - offset.x()) * scale), round((pt.y() - offset.y()) * scale)]
+    layers = []
+    for ann in annotations:
+        font = QFont(ann.font) if ann.font else QFont()
+        if font.pointSizeF() > 0:
+            font.setPointSizeF(font.pointSizeF() * scale)
+        else:
+            font.setPixelSize(max(1, round(font.pixelSize() * scale)))
+        layers.append(dict(kind=ann.kind, color=ann.color.name(QColor.NameFormat.HexArgb),
+            width=ann.width * scale, p1=point(ann.p1), p2=point(ann.p2),
+            points=[point(pt) for pt in ann.points], text=ann.text, font=font.toString()))
+    base = base.copy()
+    base.setDevicePixelRatio(1.0)
+    if not base.save(str(path.with_suffix(".base.png")), "PNG"):
+        raise OSError("无法保存可编辑截图底图")
+    stat = path.stat()
+    if not _write_json_atomic(path.with_suffix(".layers.json"),
+            dict(version=1, source=[stat.st_size, stat.st_mtime_ns], layers=layers)):
+        raise OSError("无法保存截图编辑信息")
+
+
+def _load_editable_layers(path):
+    path = Path(path)
+    # Only our own local draft images carry trusted editor metadata.
+    if path.resolve().parent != IMG_DIR.resolve():
+        return None
+    meta = path.with_suffix(".layers.json")
+    if not meta.exists():
+        return None
+    try:
+        data = json.loads(meta.read_text(encoding="utf-8"))
+        stat = path.stat()
+        if data.get("version") != 1 or data.get("source") != [stat.st_size, stat.st_mtime_ns]:
+            return None
+        base = QPixmap(str(path.with_suffix(".base.png")))
+        if base.isNull():
+            return None
+        annotations = []
+        for layer in data["layers"]:
+            if layer["kind"] not in ("text", "rect", "ellipse", "arrow", "pen"):
+                return None
+            ann = _Annotation(layer["kind"], QColor(layer["color"]), layer["width"])
+            ann.p1, ann.p2 = QPoint(*layer["p1"]), QPoint(*layer["p2"])
+            ann.points = [QPoint(*pt) for pt in layer["points"]]
+            ann.text = layer["text"]
+            ann.font = QFont()
+            ann.font.fromString(layer["font"])
+            annotations.append(ann)
+        return base, annotations
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _edit_annotation_text(owner, index):
+    if index is None or owner._annotations[index].kind != "text":
+        return False
+    from PyQt6.QtWidgets import QInputDialog
+    ann = owner._annotations[index]
+    text, accepted = QInputDialog.getMultiLineText(owner, "编辑标注文字", "文字内容：", ann.text)
+    if accepted:
+        if text.strip():
+            ann.text = text
+            owner._selected = index
+        else:
+            owner._annotations.pop(index)
+            owner._selected = None
+        owner._moving = False
+        owner.update()
+    return True
+
+
 class ScreenshotOverlay(QWidget):
     """应用内区域截图: 暗化遮罩 + 拖拽选区 + 标注工具(矩形/椭圆/箭头/画笔/文字)。
 
@@ -1426,6 +1686,7 @@ class ScreenshotOverlay(QWidget):
         self._width = 4
         self._toolbar = None
         self._text_edit = None
+        self._text_size = _text_size_setting()
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
@@ -1565,6 +1826,7 @@ class ScreenshotOverlay(QWidget):
         hit = self._hit_test(pos)
         if hit is not None:
             self._selected = hit
+            _sync_annotation_font(self)
             self._moving = True
             self._move_last = pos
             self.update()
@@ -1739,6 +2001,9 @@ class ScreenshotOverlay(QWidget):
             self.update()
 
     def mouseDoubleClickEvent(self, e):
+        if self._mode == "annotating" and self._text_edit is None:
+            if _edit_annotation_text(self, self._hit_test(e.pos())):
+                return
         if self._mode == "annotating" and self._sel.contains(e.pos()) \
                 and self._text_edit is None and self._hit_test(e.pos()) is None \
                 and _handle_at(self._sel, e.pos()) is None:
@@ -1754,7 +2019,7 @@ class ScreenshotOverlay(QWidget):
     def _begin_text(self, pos):
         ed = _TextInput(self)
         f = QFont()
-        f.setPointSize(14)
+        f.setPointSize(self._text_size)
         ed.setFont(f)
         ed.setStyleSheet(
             f"background:transparent; border:1px dashed {self._color.name()};"
@@ -1776,8 +2041,9 @@ class ScreenshotOverlay(QWidget):
             ann = _Annotation("text", color, self._width)
             ann.p1 = pos
             ann.text = text
-            ann.font = font
+            ann.font = QFont(ed.font())
             self._annotations.append(ann)
+            self._selected = len(self._annotations) - 1
         ed.deleteLater()
         self.update()
 
@@ -1845,6 +2111,7 @@ class ScreenshotOverlay(QWidget):
         add_tool("arrow", "箭头")
         add_tool("pen", "画笔")
         add_tool("text", "文字")
+        _font_size_control(lay, self)
 
         self._add_sep(lay)
         # 颜色
@@ -1956,6 +2223,7 @@ class ScreenshotOverlay(QWidget):
             phys = QRect(int(sel.x() * dpr), int(sel.y() * dpr),
                          int(sel.width() * dpr), int(sel.height() * dpr))
             result = self._full.copy(phys)
+            base = result.copy()
             result.setDevicePixelRatio(dpr)        # 让 painter 工作在逻辑坐标
             if self._annotations:
                 pr = QPainter(result)
@@ -1968,7 +2236,9 @@ class ScreenshotOverlay(QWidget):
             result.setDevicePixelRatio(1.0)        # 保存为全分辨率
             IMG_DIR.mkdir(parents=True, exist_ok=True)
             out = IMG_DIR / f"stage_{int(time.time() * 1000)}.png"
-            result.save(str(out), "PNG")
+            if not result.save(str(out), "PNG"):
+                raise OSError("截图保存失败")
+            _save_editable_layers(out, base, self._annotations, sel.topLeft(), dpr)
             return str(out)
         except Exception:
             return None
@@ -2008,6 +2278,7 @@ class _EditorCanvas(QWidget):
         self._color = QColor(ScreenshotOverlay.COLORS[0])
         self._width = 4
         self._text_edit = None
+        self._text_size = _text_size_setting()
         # 裁剪
         self._crop_mode = False
         self._crop_rect = QRect()
@@ -2193,9 +2464,13 @@ class _EditorCanvas(QWidget):
     def result_pixmap(self):
         if self._crop_mode:
             self.apply_crop()
-        self._bake()
-        self._annotations.clear()
-        return self._pixmap
+        result = self._pixmap.copy()
+        painter = QPainter(result)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        for ann in self._annotations:
+            _draw_annotation(painter, ann)
+        painter.end()
+        return result
 
     # ---------- 命中测试 ----------
     def _hit_test(self, pos):
@@ -2246,6 +2521,7 @@ class _EditorCanvas(QWidget):
         hit = self._hit_test(pos)
         if hit is not None:
             self._selected = hit
+            _sync_annotation_font(self)
             self._moving = True
             self._move_last = pos
             self.update()
@@ -2380,10 +2656,16 @@ class _EditorCanvas(QWidget):
         return (ann.p2 - ann.p1).manhattanLength() >= 3
 
     # ---------- 文字标注 ----------
+    def mouseDoubleClickEvent(self, event):
+        if not self._crop_mode and self._text_edit is None:
+            if _edit_annotation_text(self, self._hit_test(self._to_img(event.pos()))):
+                return
+        super().mouseDoubleClickEvent(event)
+
     def _begin_text(self, pos, pos_w):
         ed = _TextInput(self)
         f = QFont()
-        f.setPointSizeF(max(8.0, 14.0))
+        f.setPointSize(self._text_size)
         ed.setFont(f)
         ed.setStyleSheet(
             f"background:transparent; border:1px dashed {self._color.name()};"
@@ -2406,9 +2688,10 @@ class _EditorCanvas(QWidget):
             ann.p1 = pos
             ann.text = text
             f = QFont()
-            f.setPointSizeF(max(6.0, 14.0 / self._scale))   # 显示 14pt 烘焙到图片像素
+            f.setPointSizeF(ed.font().pointSizeF() / self._scale)
             ann.font = f
             self._annotations.append(ann)
+            self._selected = len(self._annotations) - 1
         ed.deleteLater()
         self.update()
 
@@ -2431,7 +2714,11 @@ class ImageEditorDialog(QDialog):
         self.setStyleSheet(STYLE)
         self.result_path = None
         self._src_path = image_path
-        self.canvas = _EditorCanvas(QPixmap(image_path))
+        layers = _load_editable_layers(image_path)
+        self.canvas = _EditorCanvas(layers[0] if layers else QPixmap(image_path))
+        if layers:
+            self.canvas._annotations = layers[1]
+        self.canvas.setToolTip("双击文字标注可修改内容；裁剪或旋转会将现有标注合并到图片。")
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -2453,8 +2740,8 @@ class ImageEditorDialog(QDialog):
         self.canvas.on_changed = lambda: holder.adjustSize()
         screen = QApplication.primaryScreen()
         avail = screen.availableGeometry() if screen else QRect(0, 0, 1100, 800)
-        self.resize(min(avail.width() - 80, self.canvas.width() + 120),
-                    min(avail.height() - 80, self.canvas.height() + 150))
+        self.resize(min(avail.width() - 40, max(680, self.canvas.width() + 120)),
+                    min(avail.height() - 40, max(360, self.canvas.height() + 190)))
 
     def _build_toolbar(self):
         bar = QFrame()
@@ -2465,7 +2752,11 @@ class ImageEditorDialog(QDialog):
             " border-radius:6px; padding:5px 7px; font-size:15px; }"
             " QToolButton:hover { background:#343945; }"
             " QToolButton:checked { background:#5B8CFF; color:#FFFFFF; }")
-        lay = QHBoxLayout(bar)
+        rows = QVBoxLayout(bar)
+        rows.setContentsMargins(4, 4, 4, 4)
+        rows.setSpacing(3)
+        lay = QHBoxLayout()
+        rows.addLayout(lay)
         lay.setContentsMargins(8, 6, 8, 6)
         lay.setSpacing(2)
         self._tool_btns = {}
@@ -2486,6 +2777,7 @@ class ImageEditorDialog(QDialog):
         add_tool("arrow", "箭头")
         add_tool("pen", "画笔")
         add_tool("text", "文字")
+        _font_size_control(lay, self.canvas)
 
         self._add_sep(lay)
         self._color_btns = []
@@ -2515,7 +2807,10 @@ class ImageEditorDialog(QDialog):
             lay.addWidget(b)
             self._width_btns.append((w, b))
 
-        self._add_sep(lay)
+        lay.addStretch()
+        lay = QHBoxLayout()
+        lay.setContentsMargins(8, 0, 8, 2)
+        rows.addLayout(lay)
         self._btn_crop = QToolButton(bar)
         self._btn_crop.setText("裁剪")
         self._btn_crop.setCheckable(True)
@@ -2609,7 +2904,9 @@ class ImageEditorDialog(QDialog):
         try:
             IMG_DIR.mkdir(parents=True, exist_ok=True)
             out = IMG_DIR / f"stage_{int(time.time() * 1000)}_{os.getpid()}_edit.png"
-            self.canvas.result_pixmap().save(str(out), "PNG")
+            if not self.canvas.result_pixmap().save(str(out), "PNG"):
+                raise OSError("图片保存失败")
+            _save_editable_layers(out, self.canvas._pixmap, self.canvas._annotations)
             self.result_path = str(out)
         except Exception:
             self.result_path = None
@@ -2630,6 +2927,7 @@ class Discovery:
         self.peers = {}
         self.lock = threading.Lock()
         self.running = True
+        self.advertising = threading.Event()  # 接收端口就绪后才允许广播在线
         self.local_ip = get_local_ip()   # 主 LAN IP（已过滤 VPN）
         self._reply_times = {}           # ip -> 上次单播回应时间，用于限速
         # 稳定的本机设备标识：同一台机器即使有多个 IP，对端也能归并成一台
@@ -2667,6 +2965,13 @@ class Discovery:
             "ip": lan_ip, "port": TRANSFER_PORT, "uid": self.uid,
         }).encode("utf-8")
 
+    def set_receiving(self, ready):
+        if ready:
+            self.advertising.set()
+            threading.Thread(target=self.force_broadcast, daemon=True).start()
+        else:
+            self.advertising.clear()
+
     # ---- 生命周期 ----
     def start(self):
         threading.Thread(target=self._broadcaster, daemon=True).start()
@@ -2681,6 +2986,8 @@ class Discovery:
         """启动后向历史已知设备单播，加速初始发现（含 Windows 防火墙场景）。"""
         def _do():
             time.sleep(0.8)
+            if not self.advertising.is_set():
+                return
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 all_mine = self._all_ips()
@@ -2698,6 +3005,8 @@ class Discovery:
 
     def force_broadcast(self):
         """立即广播 + 单播到所有当前已知对端（刷新按钮触发）。"""
+        if not self.advertising.is_set():
+            return
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -2731,6 +3040,8 @@ class Discovery:
 
     def _unicast_reply(self, target_ip):
         """收到对端广播后，单播回应，穿透 Windows 防火墙。"""
+        if not self.advertising.is_set():
+            return
         now = time.time()
         if now - self._reply_times.get(target_ip, 0) < BROADCAST_INTERVAL:
             return
@@ -2771,6 +3082,9 @@ class Discovery:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         while self.running:
+            if not self.advertising.is_set():
+                time.sleep(0.2)
+                continue
             extra_subnets = get_setting("extra_subnets", [])
             for lan_ip in self._lan_ips():   # 每轮重新枚举，自动感知 VPN 状态变化
                 msg = self._make_msg(lan_ip)
@@ -2860,11 +3174,19 @@ class Discovery:
             return out
 
 
+def _configure_receive_socket(sock):
+    """Windows 独占接收端口；其他系统保留正常重启需要的地址复用。"""
+    if platform.system() == "Windows":
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    else:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+
 class Receiver:
     """统一接收: 文件 / 文字 / 图片。"""
     def __init__(self, on_file, on_chat, on_log, on_progress=None,
                  get_recv_confirm=None, on_recv_started=None, on_recv_done=None,
-                 on_recv_cancelled=None, on_peer_seen=None):
+                 on_recv_cancelled=None, on_peer_seen=None, on_status=None):
         self.on_file = on_file             # (path, sender)
         self.on_chat = on_chat             # (sender_name, sender_ip, kind, payload)
         self.on_log = on_log
@@ -2874,44 +3196,66 @@ class Receiver:
         self.on_recv_done = on_recv_done          # (recv_id)
         self.on_recv_cancelled = on_recv_cancelled  # (recv_id)
         self.on_peer_seen = on_peer_seen   # (sender_ip, name, uid, port) 入站连接即在线
+        self.on_status = on_status or (lambda ready, reason: None)
+        self._serve_lock = threading.Lock()
+        self._listen_socket = None
         self.running = True
         self._conn_sem = threading.Semaphore(MAX_CONNS)  # 限制并发连接数
+        self._receipt_lock = threading.Lock()
+        self._receipts = {}
+        self._active_receipts = set()
+        self.active_connections = 0
 
     def start(self):
-        threading.Thread(target=self._serve, daemon=True).start()
+        # 重试按钮和初次启动共享此入口，同一时刻只允许一个监听线程。
+        if not self._serve_lock.acquire(blocking=False):
+            return
+        self.running = True
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
 
     def stop(self):
         self.running = False
+        sock = self._listen_socket
+        if sock is not None:
+            sock.close()
 
     def _serve(self):
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s = None
+        failure = ""
         try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            _configure_receive_socket(s)
             s.bind(("", TRANSFER_PORT))
             s.listen(8)
             s.settimeout(1.0)
-        except Exception as e:
-            self.on_log(f"无法监听端口 {TRANSFER_PORT}: {e}", "error")
-            return
-        while self.running:
-            try:
-                conn, addr = s.accept()
-            except socket.timeout:
-                continue
-            except Exception:
-                continue
-            # 并发已满则直接拒收该连接，避免无上限地起线程/堆内存
-            if not self._conn_sem.acquire(blocking=False):
-                self.on_log(f"并发连接已达上限({MAX_CONNS})，拒收来自 {addr[0]}", "error")
+            self._listen_socket = s
+            self.on_status(True, "")
+            while self.running:
                 try:
+                    conn, addr = s.accept()
+                except socket.timeout:
+                    continue
+                # 不再静默死循环；监听异常会关闭端口、更新界面，并允许用户重试。
+                if not self._conn_sem.acquire(blocking=False):
+                    self.on_log(f"并发连接已达上限({MAX_CONNS})，拒收来自 {addr[0]}", "error")
                     conn.close()
-                except Exception:
-                    pass
-                continue
-            threading.Thread(target=self._handle, args=(conn, addr),
-                             daemon=True).start()
+                    continue
+                threading.Thread(target=self._handle, args=(conn, addr), daemon=True).start()
+        except Exception as e:
+            if self.running:
+                failure = f"无法接收文件：端口 {TRANSFER_PORT} 不可用。可能被其他程序占用或无访问权限。\n{e}"
+                self.on_log(failure, "error")
+        finally:
+            if s is not None:
+                s.close()
+            self._listen_socket = None
+            self._serve_lock.release()
+            self.on_status(False, failure)
 
     def _handle(self, conn, addr):
+        with self._receipt_lock:
+            self.active_connections += 1
         try:
             # 握手阶段设较短超时，挡住“连上却不发数据”的连接（slowloris）
             conn.settimeout(HANDSHAKE_TIMEOUT)
@@ -2955,221 +3299,157 @@ class Receiver:
                     f"请让双方都更新到最新版本。", "error")
                 return
 
-            # file / image 都带二进制负载
-            filename_hint = header.get("filename", "file.bin")
-            single_recv_id = uuid.uuid4().hex[:10]
-            if self.on_recv_started and size > 0:
-                meta = [{"type": kind, "name": filename_hint, "size": size}]
-                self.on_recv_started(single_recv_id, sender, sender_ip,
-                                     json.dumps(meta, ensure_ascii=False))
-
-            # 先确定落盘路径，再边收边写（不把整文件堆内存）
-            confirm = False
-            if kind == "image":
-                IMG_DIR.mkdir(parents=True, exist_ok=True)
-                dest = IMG_DIR / f"recv_{int(time.time()*1000)}.png"
-            else:
-                folder = safe_folder_name(sender)
-                confirm = self.get_recv_confirm()
-                dest_dir = (TEMP_RECV_DIR if confirm else globals()["RECV_ROOT"]) / folder
-                dest_dir.mkdir(parents=True, exist_ok=True)
-                filename = os.path.basename(filename_hint)
-                dest = dest_dir / filename
-                b, e = os.path.splitext(filename)
-                i = 1
-                while dest.exists():
-                    dest = dest_dir / f"{b}_{i}{e}"
-                    i += 1
-                # 落盘前再校验一次最终路径仍在接收根目录内（与批量分支一致，纵深防御）
-                root = TEMP_RECV_DIR if confirm else globals()["RECV_ROOT"]
-                if not dest_within_root(dest, root):
-                    self.on_log(f"拒收越界路径，来自 {sender}", "error")
-                    return
-
-            t_start = time.time()
-            try:
-                with open(dest, "wb") as f:
-                    self._stream_n(conn, size, f, single_recv_id, filename_hint,
-                                   0, size, t_start)
-            except _TransferAborted:
-                try:
-                    Path(dest).unlink(missing_ok=True)
-                except Exception:
-                    pass
-                self.on_log(f"{filename_hint} 传输被取消", "info")
-                if self.on_recv_cancelled and size > 0:
-                    self.on_recv_cancelled(single_recv_id)
-                return
-            except Exception:
-                # 磁盘满/权限错等异常：清理半截文件，再上抛给外层统一记录
-                try:
-                    Path(dest).unlink(missing_ok=True)
-                except Exception:
-                    pass
-                raise
-
-            if self.on_recv_done and size > 0:
-                self.on_recv_done(single_recv_id)
-
-            if kind == "image":
-                self.on_chat(sender, sender_ip, "image", str(dest))
-            elif confirm:
-                # 告诉 UI 有待确认文件, kind=batch_staged
-                staged_part = [{"type": "file", "name": filename,
-                                "size": size, "path": str(dest),
-                                "final_dir": str(globals()["RECV_ROOT"] / folder)}]
-                self.on_log(f"待确认: {filename} · 来自 {sender}", "recv")
-                self.on_chat(sender, sender_ip, "batch_staged",
-                             json.dumps(staged_part, ensure_ascii=False))
-            else:
-                self.on_log(f"收到 {dest.name} · 来自 {sender} · {human_size(size)}", "recv")
-                self.on_file(str(dest), sender)
+            # 旧版单文件帧没有 COMMIT，其余路径分配和异常收尾与批量一致。
+            header["parts"] = [{"type": kind, "size": size,
+                                "filename": header.get("filename", "file.bin")}]
+            self._handle_batch(conn, header, sender, sender_ip, require_commit=False)
         except Exception as e:
             self.on_log(f"接收失败: {e}", "error")
         finally:
             conn.close()
+            with self._receipt_lock:
+                self.active_connections -= 1
             self._conn_sem.release()
 
-    def _handle_batch(self, conn, header, sender, sender_ip):
-        """接收一批消息: header.parts 描述每个部件, 之后是各二进制负载顺序拼接。"""
+    def _handle_batch(self, conn, header, sender, sender_ip, require_commit=True):
+        """每次接收只创建新路径；失败时仅清理本次拥有的数据。"""
+        import shutil
         parts = header.get("parts", [])
-        folder = safe_folder_name(sender)
+        if not isinstance(parts, list):
+            raise ValueError("消息清单无效")
+        for part in parts:
+            if not isinstance(part, dict) or part.get("type") not in ("text", "image", "file"):
+                raise ValueError("消息类型无效")
+            if part["type"] in ("file", "image"):
+                size = part.get("size", 0)
+                if type(size) is not int or size < 0:
+                    raise ValueError("文件大小无效")
+                if part["type"] == "file":
+                    safe_relpath(part.get("relpath"))  # 在任何写盘和 UI 通知前验证
+
         confirm = self.get_recv_confirm()
-        out_parts = []          # 给 UI 的渲染部件 [{type, ...}]
-        IMG_DIR.mkdir(parents=True, exist_ok=True)
+        root = Path(TEMP_RECV_DIR if confirm else RECV_ROOT)
+        final_dir = Path(RECV_ROOT) / safe_folder_name(sender)
+        dest_base = root / safe_folder_name(sender)
+        total = sum(p.get("size", 0) for p in parts if p["type"] != "text")
+        recv_id = uuid.uuid4().hex
+        transfer_id = header.get("transfer_id")
+        receipt_key = (str(header.get("uid") or sender_ip), str(transfer_id)) if transfer_id else None
+        duplicate = False
+        if receipt_key:
+            with self._receipt_lock:
+                if receipt_key in self._active_receipts:
+                    raise ValueError("同一消息正在接收中")
+                duplicate = receipt_key in self._receipts
+                self._active_receipts.add(receipt_key)
 
-        total_binary = sum(p.get("size", 0) for p in parts if p.get("type") in ("image", "file"))
-        recv_bytes = 0
-        t_start = time.time()
-        first_fname = next((p.get("filename", p.get("type", "")) for p in parts
-                            if p.get("type") in ("file", "image")), "")
-
-        # 生成唯一接收 ID，通知 UI 立即显示占位动画
-        recv_id = uuid.uuid4().hex[:10]
-        if self.on_recv_started and total_binary > 0:
-            meta = [
-                {"type": p["type"],
-                 "name": p.get("filename", "image.png") if p["type"] == "file" else "image.png",
-                 "size": p.get("size", 0)}
-                for p in parts if p.get("type") in ("file", "image")
-            ]
-            self.on_recv_started(recv_id, sender, sender_ip,
-                                 json.dumps(meta, ensure_ascii=False))
-
-        written_paths = []   # 记录已写盘的文件，用于取消时清理
-        pending_on_file = []  # 自动接收的文件，提交确认后才通知 UI
+        written, directories, groups, out = [], [], {}, []
+        started = False
+        committed = False
         try:
-            for part in parts:
-                ptype = part.get("type")
-                if ptype == "text":
-                    out_parts.append({"type": "text", "text": part.get("text", "")})
-                elif ptype == "image":
-                    size = part.get("size", 0)
-                    fn = f"recv_{int(time.time()*1000*1000)%10**13}.png"
-                    path = IMG_DIR / fn
-                    written_paths.append(path)   # 先登记，途中中断也能清理半截文件
-                    with open(path, "wb") as f:
-                        self._stream_n(conn, size, f, recv_id, first_fname,
-                                       recv_bytes, total_binary, t_start)
-                    recv_bytes += size
-                    out_parts.append({"type": "image", "path": str(path)})
-                elif ptype == "file":
-                    size = part.get("size", 0)
-                    filename = os.path.basename(part.get("filename", "file.bin"))
-                    if confirm:
-                        dest_dir = TEMP_RECV_DIR / folder
-                    else:
-                        dest_dir = globals()["RECV_ROOT"] / folder
-                    dest_dir.mkdir(parents=True, exist_ok=True)
-                    rel = safe_relpath(part.get("relpath"))
-                    dest = (dest_dir / rel) if rel else None
-                    # 防目录穿越：解析后必须仍在 dest_dir 之内，否则退回扁平文件名
-                    if dest is not None:
-                        try:
-                            inside = os.path.commonpath(
-                                [dest.resolve(strict=False),
-                                 dest_dir.resolve(strict=False)]) == str(dest_dir.resolve(strict=False))
-                        except Exception:
-                            inside = False
-                        if inside:
-                            dest.parent.mkdir(parents=True, exist_ok=True)
-                        else:
-                            dest = None
-                    if dest is None:
-                        dest = dest_dir / filename
-                        b, e = os.path.splitext(filename)
-                        i = 1
-                        while dest.exists():
-                            dest = dest_dir / f"{b}_{i}{e}"
-                            i += 1
-                    written_paths.append(dest)   # 先登记，途中中断也能清理半截文件
-                    with open(dest, "wb") as f:
-                        self._stream_n(conn, size, f, recv_id, filename,
-                                       recv_bytes, total_binary, t_start)
-                    recv_bytes += size
-                    final_dir = str(globals()["RECV_ROOT"] / folder) if confirm else ""
-                    out_parts.append({"type": "file", "name": filename,
-                                      "size": size, "path": str(dest),
-                                      "staged": confirm,
-                                      "final_dir": final_dir,
-                                      "relpath": part.get("relpath")})
-                    if not confirm:
-                        pending_on_file.append(str(dest))
-
-            # 关键：读完声明的全部字节后，还必须收到 COMMIT 标记才视为成功。
-            # 发送方取消时不发送它，接收方据此丢弃数据——即便数据已全部送达 TCP 缓冲区。
-            if self._recv_n(conn, 1) != COMMIT:
-                raise _TransferAborted("未收到完成标记")
-
-        except _TransferAborted:
-            # 发送方取消：删除已写盘的残缺文件，通知 UI 撤销占位符
-            for p in written_paths:
-                try:
-                    Path(p).unlink(missing_ok=True)
-                except Exception:
-                    pass
-            self.on_log(f"来自 {sender} 的传输被取消", "info")
-            if self.on_recv_cancelled and total_binary > 0:
-                self.on_recv_cancelled(recv_id)
-            return
-
-        # 走到这里说明已收到完成标记，才把文件交给 UI / 归档
-        for dest_path in pending_on_file:
-            self.on_file(dest_path, sender)
-        self.on_log(f"收到一批消息 · 来自 {sender} · {len(parts)} 项", "recv")
-        if self.on_recv_done and total_binary > 0:
-            self.on_recv_done(recv_id)
-        # 文字/图片永远自动接收; 仅文件在"手动确认"模式下需要确认
-        auto_parts = [p for p in out_parts if p.get("type") in ("text", "image")]
-        raw_files = [p for p in out_parts if p.get("type") == "file"]
-        # 把同一文件夹(带 relpath)的文件合并成一个文件夹卡片, 接收方看到的是文件夹
-        dest_base = (TEMP_RECV_DIR if confirm else globals()["RECV_ROOT"]) / folder
-        groups, loose = {}, []
-        for fp in raw_files:
-            rel = fp.get("relpath")
-            top = str(rel).replace("\\", "/").split("/")[0] if rel else None
-            if top:
-                groups.setdefault(top, []).append(fp)
+            if duplicate:
+                # 回执丢失后的重试：读完帧再回执，不重复保存或显示。
+                left = total
+                while left:
+                    chunk = self._recv_n(conn, min(CHUNK, left))
+                    left -= len(chunk)
+                if require_commit and self._recv_n(conn, 1) != COMMIT:
+                    raise _TransferAborted("未收到完成标记")
             else:
-                loose.append(fp)
-        file_parts = []
-        for top, members in groups.items():
-            file_parts.append({
-                "type": "file", "is_folder": True,
-                "name": f"{top}/（{len(members)} 个文件）",
-                "size": sum(m.get("size", 0) for m in members),
-                "path": str(dest_base / top),
-                "staged": confirm,
-                "final_dir": str(globals()["RECV_ROOT"] / folder) if confirm else "",
-            })
-        file_parts.extend(loose)
-        if auto_parts:
-            self.on_chat(sender, sender_ip, "batch",
-                         json.dumps(auto_parts, ensure_ascii=False))
-        if file_parts:
-            self.on_chat(sender, sender_ip,
-                         "batch_staged" if confirm else "batch",
-                         json.dumps(file_parts, ensure_ascii=False))
+                binary = [p for p in parts if p["type"] != "text"]
+                if binary and self.on_recv_started:
+                    meta = [{"type": p["type"], "name": p.get("filename", "image.png"),
+                             "size": p.get("size", 0)} for p in binary]
+                    started = True
+                    self.on_recv_started(recv_id, sender, sender_ip, json.dumps(meta, ensure_ascii=False))
+                done, t_start = 0, time.time()
+                for part in parts:
+                    kind = part["type"]
+                    if kind == "text":
+                        out.append({"type": "text", "text": part.get("text", "")})
+                        continue
+                    size = part.get("size", 0)
+                    rel = None
+                    if kind == "image":
+                        dest = _reserve_recv_path(IMG_DIR, f"recv_{uuid.uuid4().hex}.png", IMG_DIR)
+                    else:
+                        filename = safe_folder_name(str(part.get("filename", "file.bin")).replace("\\", "/").split("/")[-1])
+                        rel = safe_relpath(part.get("relpath"))
+                        if rel and "/" in rel:
+                            top, rest = rel.split("/", 1)
+                            if top not in groups:
+                                groups[top] = _reserve_recv_path(dest_base, top, root, directory=True)
+                                directories.append(groups[top])
+                            target = groups[top] / rest
+                            dest = _reserve_recv_path(target.parent, target.name, root)
+                            rel = str(dest.relative_to(dest_base)).replace("\\", "/")
+                        else:
+                            # 单段 relpath 是文件，不生成指向父目录的文件夹卡片。
+                            dest = _reserve_recv_path(dest_base, rel or filename, root)
+                            rel = None
+                    written.append(dest)
+                    with open(dest, "wb") as f:
+                        self._stream_n(conn, size, f, recv_id, dest.name, done, total, t_start)
+                    done += size
+                    if kind == "image":
+                        out.append({"type": "image", "path": str(dest)})
+                    else:
+                        out.append({"type": "file", "name": dest.name, "size": size,
+                                    "path": str(dest), "staged": confirm,
+                                    "final_dir": str(final_dir) if confirm else "", "relpath": rel})
+                if require_commit and self._recv_n(conn, 1) != COMMIT:
+                    raise _TransferAborted("未收到完成标记")
+
+                auto = [p for p in out if p["type"] in ("text", "image")]
+                files, grouped = [], {}
+                for part in (p for p in out if p["type"] == "file"):
+                    if part["relpath"]:
+                        top = part["relpath"].split("/")[0]
+                        grouped.setdefault(top, []).append(part)
+                    else:
+                        files.append(part)
+                for top, members in grouped.items():
+                    files.append({"type": "file", "is_folder": True,
+                                  "name": f"{top}/（{len(members)} 个文件）",
+                                  "size": sum(p["size"] for p in members),
+                                  "path": str(dest_base / top), "staged": confirm,
+                                  "final_dir": str(final_dir) if confirm else ""})
+                if auto:
+                    self.on_chat(sender, sender_ip, "batch", json.dumps(auto, ensure_ascii=False))
+                if files:
+                    self.on_chat(sender, sender_ip, "batch_staged" if confirm else "batch",
+                                 json.dumps(files, ensure_ascii=False))
+                committed = True
+                if receipt_key:
+                    with self._receipt_lock:
+                        self._receipts[receipt_key] = True
+                        if len(self._receipts) > 2048:
+                            self._receipts.pop(next(iter(self._receipts)))
+                if not confirm:
+                    for part in out:
+                        if part["type"] == "file":
+                            self.on_file(part["path"], sender)
+                self.on_log(f"收到一批消息 · 来自 {sender} · {len(parts)} 项", "recv")
+
+            # 仅请求回执的新版发送方等待此字节，保持接收旧客户端的兼容性。
+            if header.get("ack"):
+                conn.sendall(RECEIVED)
+        finally:
+            if not committed and not duplicate:
+                for path in written:
+                    try:
+                        path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                for path in directories:
+                    shutil.rmtree(path, ignore_errors=True)
+            if receipt_key:
+                with self._receipt_lock:
+                    self._active_receipts.discard(receipt_key)
+            if started:
+                callback = self.on_recv_done if committed else self.on_recv_cancelled
+                if callback:
+                    callback(recv_id)
 
     def _recv_n_progress(self, conn, n, recv_id, fname, base_done, total, t_start):
         """接收 n 字节(小数据/标记用), 同时上报进度。连接关闭或超时则抛出 _TransferAborted。"""
@@ -3271,12 +3551,13 @@ def send_file(filepath, peer_ip, peer_port, sender_name, on_log):
 
 
 def send_batch(items, peer_ip, peer_port, sender_name, on_log,
-               on_progress=None, first_name="", ctrl: "TransferControl | None" = None):
+               on_progress=None, first_name="", ctrl: "TransferControl | None" = None,
+               transfer_id=None):
     """
     一次性发送一批内容(文字/图片/文件)作为单个消息块。
     ctrl: TransferControl 实例，可在发送途中暂停/取消。
     on_progress(filename, done_bytes, total_bytes, speed_bps) 每 CHUNK 回调一次。
-    返回 True=完成, False=失败/取消。
+    返回 ok / error / cancelled / unconfirmed（旧端或回执丢失）。
     """
     s = None
     try:
@@ -3316,12 +3597,15 @@ def send_batch(items, peer_ip, peer_port, sender_name, on_log,
             return "cancelled"
 
         header = {"kind": "batch", "sender": sender_name, "uid": _my_uid(),
-                  "parts": parts}
+                  "parts": parts, "ack": True,
+                  "transfer_id": transfer_id or uuid.uuid4().hex}
         # 再次检查：连接之前若已取消则直接退出，避免 header 已发出而对方开始等待数据
         if ctrl and ctrl.is_cancelled:
             return "cancelled"
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(15.0)
+        if ctrl:
+            ctrl.attach_socket(s)
         s.connect((peer_ip, peer_port))
         s.settimeout(None)
         hb = json.dumps(header).encode("utf-8")
@@ -3380,8 +3664,17 @@ def send_batch(items, peer_ip, peer_port, sender_name, on_log,
             on_log("发送已取消", "info")
             return "cancelled"
         s.sendall(COMMIT)
+        s.settimeout(HANDSHAKE_TIMEOUT)
+        try:
+            acknowledged = s.recv(1) == RECEIVED
+        except (OSError, ConnectionError):
+            acknowledged = False
+        if not acknowledged:
+            on_log("未收到接收回执：对方可能为旧版本或连接已中断，请核实对方是否收到", "error")
+            s.close()
+            return "unconfirmed"
         s.close()
-        on_log(f"已发送一批消息 → {peer_ip}（{len(parts)} 项）", "send")
+        on_log(f"对方已接收 → {peer_ip}（{len(parts)} 项）", "send")
         return "ok"
     except Exception as e:
         try:
@@ -3389,8 +3682,14 @@ def send_batch(items, peer_ip, peer_port, sender_name, on_log,
                 s.close()
         except Exception:
             pass
+        if ctrl and ctrl.is_cancelled:
+            on_log("发送已取消", "info")
+            return "cancelled"
         on_log(f"批量发送失败: {e}", "error")
         return "error"
+    finally:
+        if ctrl:
+            ctrl.attach_socket(None)
 
 
 class _TransferAborted(Exception):
@@ -3403,10 +3702,27 @@ class TransferControl:
     def __init__(self):
         self._cancel = threading.Event()
         self._pause  = threading.Event()
+        self._socket = None
+        self._socket_lock = threading.Lock()
+
+    def attach_socket(self, sock):
+        with self._socket_lock:
+            self._socket = sock
+            if sock is not None and self._cancel.is_set():
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
 
     def cancel(self):
         self._cancel.set()
         self._pause.clear()   # 唤醒可能阻塞在暂停里的线程
+        with self._socket_lock:
+            if self._socket is not None:
+                try:
+                    self._socket.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
 
     def pause(self):
         self._pause.set()
@@ -3593,7 +3909,7 @@ function render(m){
   if(stick) toBottom();
 }
 
-var es = null;
+var es = null, serverEpoch = null;
 function connect(){
   if(es) es.close();
   es = new EventSource(api('/api/events'));
@@ -3602,6 +3918,18 @@ function connect(){
   es.onmessage = function(e){
     var d; try{ d = JSON.parse(e.data); }catch(err){ return; }
     if(d.t === 'hello'){
+      if(serverEpoch && serverEpoch !== d.epoch){
+        seen = {};
+        document.querySelectorAll('a.file').forEach(function(a){
+          if(a.href) fetch(a.href, {method:'HEAD'}).then(function(r){
+            if(!r.ok){ a.removeAttribute('href'); a.style.opacity = '.5'; a.title = '文件已失效，请重新发送'; }
+          }).catch(function(){ a.title = '暂时无法检查下载，请稍后重试'; });
+        });
+        document.querySelectorAll('img.chat').forEach(function(img){img.title = '电脑已重启，旧下载链接已失效';});
+        var tip = document.createElement('div'); tip.className = 'notice';
+        tip.textContent = '电脑已重新连接，正在恢复文件链接；失效文件请重新发送'; msgs.appendChild(tip);
+      }
+      serverEpoch = d.epoch;
       $('peer').textContent = d.desktop || '电脑';
       (d.msgs || []).forEach(render);
       toBottom();
@@ -3620,7 +3948,7 @@ function sendText(){
 }
 $('send').onclick = sendText;
 inp.addEventListener('keydown', function(e){
-  if(e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); sendText(); }
+  if(e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229){ e.preventDefault(); sendText(); }
 });
 inp.addEventListener('input', function(){
   inp.style.height = 'auto'; inp.style.height = Math.min(inp.scrollHeight, 110) + 'px';
@@ -3700,8 +4028,13 @@ class WebBridge:
         self.on_peers_change = on_peers_change  # () 通知主窗口合并刷新设备列表
         self.lock = threading.Lock()
         self.clients = {}    # cid -> {name, queues:[Queue], log:[msg], last, online}
-        self.downloads = {}  # fid -> 本机文件路径(桌面发给手机的文件按需拉取)
+        saved_downloads = _read_json_file(APP_DATA / "web_downloads.json", {})
+        self.downloads = {key: path for key, path in saved_downloads.items()
+                          if isinstance(key, str) and re.fullmatch(r"[0-9a-f]+", key) and isinstance(path, str)} if isinstance(saved_downloads, dict) else {}
+        # Stable local registrations let already-open phone pages recover downloads after restart.
         self._seq = 0
+        self.epoch = uuid.uuid4().hex
+        self.active_requests = 0
         self._server = None
         token = get_setting("web_token", None)
         if not token:
@@ -3844,7 +4177,7 @@ class WebBridge:
         with self.lock:
             c = self._ensure(cid)
             self._seq += 1
-            msg = {"id": self._seq, "who": who, "name": name,
+            msg = {"id": f"{self.epoch}:{self._seq}", "who": who, "name": name,
                    "ts": now_hm(), "parts": parts}
             c["log"].append(msg)
             del c["log"][:-300]           # 只保留最近 300 条(会话级)
@@ -3864,6 +4197,7 @@ class WebBridge:
             if len(self.downloads) > _WEB_MAX_DOWNLOADS:
                 for old in list(self.downloads)[:-_WEB_MAX_DOWNLOADS]:
                     self.downloads.pop(old, None)
+            _write_json_atomic(APP_DATA / "web_downloads.json", self.downloads)
         return fid
 
     def get_download(self, fid):
@@ -3905,7 +4239,7 @@ class WebBridge:
         self.on_chat(name, f"web:{cid}", "batch",
                      json.dumps(echo, ensure_ascii=False))
 
-    def note_upload(self, cid, name, dest, size):
+    def note_upload(self, cid, name, dest, size, final_dir=None):
         self.touch(cid, name)
         dest = Path(dest)
         fid = self.register_download(str(dest))
@@ -3919,7 +4253,9 @@ class WebBridge:
                     "name": dest.name, "size": size}
         self._append_and_broadcast(cid, "phone", name, [echo])
         self.on_log(f"收到 {dest.name} · 来自 {name}(手机网页) · {human_size(size)}", "recv")
-        self.on_chat(name, f"web:{cid}", "batch",
+        if final_dir is not None:
+            desk_part.update(staged=True, final_dir=str(final_dir))
+        self.on_chat(name, f"web:{cid}", "batch_staged" if final_dir is not None else "batch",
                      json.dumps([desk_part], ensure_ascii=False))
 
 
@@ -3966,7 +4302,32 @@ class _WebHandler(BaseHTTPRequestHandler):
     def _reply_html(self, html, code=200):
         self._reply(html.encode("utf-8"), "text/html; charset=utf-8", code)
 
+    def _tracked_transfer(self, action):
+        with self.bridge.lock:
+            self.bridge.active_requests += 1
+        try:
+            return action()
+        finally:
+            with self.bridge.lock:
+                self.bridge.active_requests -= 1
+
     # ---- 路由 ----
+    def do_HEAD(self):
+        try:
+            route, qs = self._route()
+            if not self._authed(qs):
+                status = 403
+            elif route.startswith("/api/dl/"):
+                path = self.bridge.get_download(route[len("/api/dl/"):])
+                status = 200 if path and Path(path).is_file() else 404
+            else:
+                status = 404
+            self.send_response(status)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        except (OSError, ConnectionError):
+            pass
+
     def do_GET(self):
         try:
             path, qs = self._route()
@@ -3979,12 +4340,13 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/events":
                 return self._sse(qs)
             if path.startswith("/api/dl/"):
-                return self._download(path[len("/api/dl/"):], qs)
+                return self._tracked_transfer(lambda: self._download(path[len("/api/dl/"):], qs))
             self._reply_json({"error": "not found"}, 404)
         except (BrokenPipeError, ConnectionResetError, socket.timeout):
             pass
         except Exception:
-            pass
+            import traceback
+            self.bridge.on_log(traceback.format_exc(), "error")
 
     def do_POST(self):
         try:
@@ -3998,12 +4360,13 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/msg":
                 return self._msg(cid, name)
             if path == "/api/upload":
-                return self._upload(cid, name, qs)
+                return self._tracked_transfer(lambda: self._upload(cid, name, qs))
             self._reply_json({"error": "not found"}, 404)
         except (BrokenPipeError, ConnectionResetError, socket.timeout):
             pass
         except Exception:
-            pass
+            import traceback
+            self.bridge.on_log(traceback.format_exc(), "error")
 
     # ---- SSE: 桌面 → 手机推送 ----
     def _sse(self, qs):
@@ -4025,7 +4388,7 @@ class _WebHandler(BaseHTTPRequestHandler):
 
         q = b.attach(cid, name)
         try:
-            emit({"t": "hello", "desktop": b.hostname, "msgs": b.client_log(cid)})
+            emit({"t": "hello", "desktop": b.hostname, "epoch": b.epoch, "msgs": b.client_log(cid)})
             while b.running():
                 try:
                     item = q.get(timeout=5.0)
@@ -4072,14 +4435,11 @@ class _WebHandler(BaseHTTPRequestHandler):
             size = 0
         if size <= 0:
             return self._reply_json({"error": "empty"}, 400)
-        dest_dir = globals()["RECV_ROOT"] / safe_folder_name(name)
+        final_dir = globals()["RECV_ROOT"] / safe_folder_name(name)
+        confirm = bool(get_setting("recv_confirm", False))
+        dest_dir = TEMP_RECV_DIR / uuid.uuid4().hex if confirm else final_dir
         dest_dir.mkdir(parents=True, exist_ok=True)
-        dest = dest_dir / fname
-        base, ext = os.path.splitext(fname)
-        i = 1
-        while dest.exists():
-            dest = dest_dir / f"{base}_{i}{ext}"
-            i += 1
+        dest = _reserve_recv_path(dest_dir, fname, dest_dir)
         got = 0
         try:
             with open(dest, "wb") as f:
@@ -4095,7 +4455,7 @@ class _WebHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
             raise
-        self.bridge.note_upload(cid, name, dest, size)
+        self.bridge.note_upload(cid, name, dest, size, final_dir=final_dir if confirm else None)
         self._reply_json({"ok": True})
 
     # ---- 手机下载(桌面发来的文件/图片), 支持 Range 断点 ----
@@ -4144,6 +4504,12 @@ class _WebHandler(BaseHTTPRequestHandler):
 
 # ----------------------------- Qt 信号桥 -----------------------------
 class Signals(QObject):
+    background_done = pyqtSignal(str, object, str)
+    staged_resolved = pyqtSignal(str, object)
+    delivery_changed = pyqtSignal()
+    folder_progress = pyqtSignal(str, int, "qint64")
+    folder_done = pyqtSignal(str, object, "qint64", str)
+    receiver_status = pyqtSignal(bool, str)
     peers_changed = pyqtSignal(dict)
     log = pyqtSignal(str, str)
     chat_in = pyqtSignal(str, str, str, str)    # sender_name, sender_ip, kind, payload
@@ -4156,6 +4522,7 @@ class Signals(QObject):
     recv_progress = pyqtSignal(str, str, 'qint64', 'qint64', float)   # recv_id, filename, done, total, speed_bps
     send_unit_progress = pyqtSignal(str, 'qint64', 'qint64', float)  # unit_id, done, total, speed
     send_unit_result = pyqtSignal(str, str, str)           # unit_id, status(ok/cancelled/error), reason
+    text_result = pyqtSignal(str, str, str, str, str)      # ip, msg_id, status, reason, queue_id
     recv_done = pyqtSignal(str)                             # recv_id
     recv_cancelled = pyqtSignal(str)                        # recv_id — 发送方取消传输
 
@@ -4654,7 +5021,7 @@ class FileCard(QFrame):
 
 
 class Bubble(QFrame):
-    def __init__(self, kind, payload, mine, ts, name, pending=False):
+    def __init__(self, kind, payload, mine, ts, name, pending=False, delivery=None):
         super().__init__()
         self.setObjectName("bubbleRow")
         row = QHBoxLayout(self)
@@ -4667,6 +5034,16 @@ class Bubble(QFrame):
         if pending:
             meta_text += "  ⏳ 离线发送"
         meta = QLabel(meta_text)
+        self._meta_label = meta
+        self._meta_base = f"{name} · {ts}"
+        self._delivery = delivery
+        self._retry_callback = None
+        self.retry_button = QPushButton("重试")
+        self.retry_button.setObjectName("miniBtn")
+        self.retry_button.hide()
+        self.retry_button.clicked.connect(lambda: self._retry_callback() if self._retry_callback else None)
+        if delivery:
+            self.set_delivery(delivery)
         meta.setObjectName("bubbleMeta")
         meta.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
         meta.setAlignment(Qt.AlignmentFlag.AlignRight if mine
@@ -4686,6 +5063,7 @@ class Bubble(QFrame):
 
         col.addWidget(meta)
         col.addWidget(body)
+        col.addWidget(self.retry_button, 0, Qt.AlignmentFlag.AlignRight)
 
         if mine:
             row.addStretch()
@@ -4693,6 +5071,20 @@ class Bubble(QFrame):
         else:
             row.addLayout(col)
             row.addStretch()
+
+    def set_retry(self, callback):
+        self._retry_callback = callback
+        self.retry_button.setVisible(self._delivery in ("error", "unconfirmed", "cancelled"))
+
+    def set_delivery(self, status, reason=""):
+        self._delivery = status
+        self.retry_button.setVisible(bool(self._retry_callback) and status in ("error", "unconfirmed", "cancelled"))
+        labels = {"queued": "⏳ 等待上线", "sending": "发送中…",
+                  "ok": "✓ 对方已接收", "error": "⚠ 发送失败",
+                  "unconfirmed": "⚠ 未确认接收", "offered": "已推送到网页",
+                  "cancelled": "已撤销", "cancelling": "正在撤销…"}
+        self._meta_label.setText(self._meta_base + "  " + labels.get(status, status))
+        self._meta_label.setToolTip(reason)
 
     def _normalize(self, kind, payload):
         """把旧的 text/image 单条 与 新的 batch 统一成 parts 列表。"""
@@ -4767,60 +5159,320 @@ class AttachChip(QFrame):
         lay.addWidget(x)
 
 
+def _task_dialog_style():
+    t = THEMES[_current_theme_name]
+    return STYLE + f"""
+        QDialog#taskDialog {{ background:{t['win_bg']}; }}
+        QLabel {{ color:{t['t2']}; }}
+        QLineEdit {{ background:{t['s1']}; color:{t['t1']}; border:1px solid {t['b2']}; padding:8px; border-radius:6px; }}
+        QTableWidget {{ background:{t['s1']}; color:{t['t1']}; gridline-color:{t['b1']}; border:1px solid {t['b1']}; }}
+        QTableWidget::item:selected {{ background:{t['accent']}; color:{t['accent_text']}; }}
+        QHeaderView::section {{ background:{t['s2']}; color:{t['t2']}; padding:8px; border:none; }}
+    """
+
+
+def _history_search_text(message):
+    payload = message.get("payload", "")
+    if message.get("kind") == "batch":
+        try:
+            payload = json.dumps(json.loads(payload), ensure_ascii=False)
+        except (ValueError, TypeError):
+            pass
+    return " ".join([str(payload)] + [str(message.get(key, "")) for key in ("name", "day", "ts")]).casefold()
+
+
 class HistoryDialog(QDialog):
-    """聊天记录弹窗: 显示与某设备的全部历史消息(含日期分隔)。"""
-    def __init__(self, parent, peer_name, msgs):
+    """后台搜索、每页最多 50 条，避免一次创建全部历史气泡。"""
+    filtered = pyqtSignal(int, object)
+    page_ready = pyqtSignal(int, int, int, object, str)
+    PAGE_SIZE = 50
+
+    def __init__(self, parent, peer_name, msgs, on_retry=None, store=None, ips=None):
         super().__init__(parent)
+        self._store, self._ips = store, tuple(ips or [])
+        self._closed = False
+        self._query_cancel = threading.Event()
+        self._page = 0
+        self.page_ready.connect(self._apply_page)
         self.setWindowTitle(f"聊天记录 · {peer_name}")
-        self.resize(560, 640)
-        self.setStyleSheet(STYLE)
+        self.resize(620, 680)
+        self.setObjectName("taskDialog")
+        self.setStyleSheet(_task_dialog_style())
+        self._messages = list(msgs)
+        self._matches = self._messages
+        self._generation = 0
+        self._on_retry = on_retry
+        if parent is not None and hasattr(parent, "signals"):
+            parent.signals.delivery_changed.connect(self._refresh_delivery)
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(0)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("搜索文字、文件名或日期，例如 2026-09-11")
+        self.search.setClearButtonEnabled(True)
+        lay.addWidget(self.search)
+        self.scroll = QScrollArea()
+        self.scroll.setObjectName("chatScroll")
+        self.scroll.setWidgetResizable(True)
+        lay.addWidget(self.scroll, 1)
+        nav = QHBoxLayout()
+        self.previous = QPushButton("上一页")
+        self.next = QPushButton("下一页")
+        self.page_label = QLabel()
+        nav.addWidget(self.previous)
+        nav.addWidget(self.page_label, 1, Qt.AlignmentFlag.AlignCenter)
+        nav.addWidget(self.next)
+        lay.addLayout(nav)
+        self.previous.clicked.connect(lambda: self._show_page(self._page - 1))
+        self.next.clicked.connect(lambda: self._show_page(self._page + 1))
+        self._debounce = QTimer(self)
+        self._debounce.setSingleShot(True)
+        self._debounce.setInterval(200)
+        self._debounce.timeout.connect(self._search)
+        self.search.textChanged.connect(self._schedule_search)
+        self.filtered.connect(self._apply_filter)
+        self._show_page(-1 if self._store else max(0, (len(self._matches) - 1) // self.PAGE_SIZE))
 
-        head = QFrame()
-        head.setObjectName("chatHeader")
-        head.setFixedHeight(50)
-        hl = QHBoxLayout(head)
-        hl.setContentsMargins(18, 0, 18, 0)
-        title = QLabel(f"与 {peer_name} 的聊天记录")
-        title.setObjectName("chatTitle")
-        hl.addWidget(title)
-        hl.addStretch()
-        lay.addWidget(head)
+    def done(self, result):
+        self._closed = True
+        self._query_cancel.set()
+        self._generation += 1
+        self._debounce.stop()
+        super().done(result)
+        self.deleteLater()
 
-        scroll = QScrollArea()
-        scroll.setObjectName("chatScroll")
-        scroll.setWidgetResizable(True)
+    def _refresh_delivery(self):
+        if self.isVisible():
+            self._show_page(self._page)
+
+    def _schedule_search(self):
+        self._query_cancel.set()
+        self._generation += 1
+        self._debounce.start()
+
+    def _search(self):
+        if self._store:
+            self._show_page(-1)
+            return
+        generation, query = self._generation, self.search.text().strip().casefold()
+        self.page_label.setText("搜索中…")
+        messages = self._messages
+        def worker():
+            matches = [m for m in messages if not query or query in _history_search_text(m)]
+            try:
+                self.filtered.emit(generation, matches)
+            except RuntimeError:  # 弹窗已关闭
+                pass
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_filter(self, generation, matches):
+        if generation != self._generation:
+            return
+        self._matches = matches
+        self._show_page(max(0, (len(matches) - 1) // self.PAGE_SIZE))
+
+    def _apply_page(self, generation, total, page, records, error):
+        if self._closed or generation != self._generation:
+            return
+        if error:
+            self.page_label.setText("读取历史失败，请重新打开窗口")
+            return
+        self._render_page(page, total, records)
+
+    def _show_page(self, page):
+        if self._store:
+            self._generation += 1
+            self._query_cancel.set()
+            self._query_cancel = threading.Event()
+            cancel = self._query_cancel
+            generation, query = self._generation, self.search.text().strip()
+            store, ips, signal = self._store, self._ips, self.page_ready
+            self.page_label.setText("正在读取…")
+            self.previous.setEnabled(False)
+            self.next.setEnabled(False)
+            def worker():
+                try:
+                    total, actual, records = store.page(ips, query, page, self.PAGE_SIZE, cancel=cancel)
+                    error = ""
+                except Exception as exc:
+                    total, actual, records, error = 0, 0, [], str(exc)
+                try:
+                    signal.emit(generation, total, actual, records, error)
+                except RuntimeError:
+                    pass
+            threading.Thread(target=worker, daemon=True).start()
+            return
+        pages = max(1, (len(self._matches) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        actual = max(0, min(page, pages - 1))
+        self._render_page(actual, len(self._matches), self._matches[actual * self.PAGE_SIZE:(actual + 1) * self.PAGE_SIZE])
+
+    def _locate_message(self, record):
+        self._debounce.stop()
+        self._query_cancel.set()
+        self._highlight_record = record
+        self.search.blockSignals(True)
+        self.search.clear()
+        self.search.blockSignals(False)
+        if self._store:
+            self._generation += 1
+            generation, store, ips, signal = self._generation, self._store, self._ips, self.page_ready
+            def worker():
+                try:
+                    page = store.context_page(ips, record, self.PAGE_SIZE)
+                    total, page, records = store.page(ips, '', page, self.PAGE_SIZE)
+                    signal.emit(generation, total, page, records, '')
+                except Exception:
+                    try:
+                        signal.emit(generation, 0, 0, [], 'lookup failed')
+                    except RuntimeError:
+                        pass
+            threading.Thread(target=worker, daemon=True).start()
+        else:
+            self._matches = self._messages
+            self._show_page(self._messages.index(record) // self.PAGE_SIZE)
+
+    def _render_page(self, page, total, records):
+        pages = max(1, (total + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        self._page = page
         canvas = QWidget()
         canvas.setObjectName("chatCanvas")
-        cv = QVBoxLayout(canvas)
-        cv.setContentsMargins(20, 14, 20, 14)
-        cv.setSpacing(2)
+        layout = QVBoxLayout(canvas)
+        last_day = None
+        for m in records:
+            if m.get("day") and m["day"] != last_day:
+                layout.addWidget(QLabel(m["day"]))
+                last_day = m["day"]
+            bubble = Bubble(m["kind"], m["payload"], m["mine"], m["ts"], m["name"],
+                            m.get("pending", False), m.get("delivery"))
+            if self._on_retry and m.get("msg_id"):
+                bubble.set_retry(lambda mid=m["msg_id"]: self._on_retry(mid))
+            layout.addWidget(bubble)
+            if self.search.text().strip():
+                locate = QPushButton("定位此消息 · 查看上下文")
+                locate.clicked.connect(lambda _=False, record=m: self._locate_message(record))
+                layout.addWidget(locate)
+            target = getattr(self, "_highlight_record", None)
+            if target and ((target.get("msg_id") and target.get("msg_id") == m.get("msg_id")) or target == m):
+                bubble.setStyleSheet(f"border:2px solid {_theme_color('accent')}; border-radius:8px;")
+                QTimer.singleShot(0, lambda b=bubble: self.scroll.ensureWidgetVisible(b))
+        if not total:
+            layout.addWidget(QLabel("没有匹配的聊天记录"))
+        layout.addStretch()
+        old = self.scroll.takeWidget()
+        if old:
+            old.deleteLater()
+        self.scroll.setWidget(canvas)
+        self.page_label.setText(f"第 {self._page + 1} / {pages} 页 · {total} 条")
+        self.previous.setEnabled(self._page > 0)
+        self.next.setEnabled(self._page + 1 < pages)
 
-        if not msgs:
-            empty = QLabel("暂无历史聊天记录")
-            empty.setObjectName("emptyChat")
-            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            cv.addWidget(empty)
-        else:
-            last_day = None
-            for m in msgs:
-                day = m.get("day")
-                if day and day != last_day:
-                    d = QLabel(day)
-                    d.setObjectName("dayDivider")
-                    d.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                    cv.addWidget(d)
-                    last_day = day
-                cv.addWidget(Bubble(m["kind"], m["payload"], m["mine"], m["ts"], m["name"],
-                                   m.get("pending", False)))
-        cv.addStretch()
-        scroll.setWidget(canvas)
-        lay.addWidget(scroll, 1)
-        # 打开后定位到最新消息（底部）
-        QTimer.singleShot(50, lambda: scroll.verticalScrollBar().setValue(
-            scroll.verticalScrollBar().maximum()))
+
+class SendQueueDialog(QDialog):
+    """发送任务以部件为单位重试或撤销，已成功的部件不会重复发送。"""
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.window = parent
+        self.setWindowTitle("发送队列")
+        self.resize(760, 460)
+        self.setObjectName("taskDialog")
+        self.setStyleSheet(_task_dialog_style())
+        layout = QVBoxLayout(self)
+        filters = QHBoxLayout()
+        self.device_filter = QComboBox()
+        self.device_filter.addItem("所有设备", "")
+        identities = {}
+        for ip, entries in parent.offline_queue.items():
+            for entry in entries:
+                identity = entry.get("recipient", ip)
+                identities[identity] = entry.get("recipient_name") or identity
+        for identity, name in identities.items():
+            self.device_filter.addItem(name, identity)
+        self.status_filter = QComboBox()
+        for label, status in [("所有状态", ""), ("等待", "queued"), ("失败", "error"), ("未确认", "unconfirmed"), ("发送中", "sending")]:
+            self.status_filter.addItem(label, status)
+        filters.addWidget(self.device_filter); filters.addWidget(self.status_filter)
+        layout.addLayout(filters)
+        hint = QLabel("离线任务会在设备上线后发送。失败可重试；未确认的任务请先核实对方是否收到。")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        self.table = QTableWidget(0, 5)
+        self.table.verticalHeader().hide()
+        self.table.verticalHeader().setDefaultSectionSize(40)
+        self.table.setHorizontalHeaderLabels(["设备", "内容", "状态", "重试", "撤销"])
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
+        layout.addWidget(self.table, 1)
+        batch = QHBoxLayout()
+        for label, retry in [("重试选中", True), ("撤销选中", False)]:
+            button = QPushButton(label)
+            button.clicked.connect(lambda _=False, r=retry: self._batch(r))
+            batch.addWidget(button)
+        layout.addLayout(batch)
+        self.device_filter.currentIndexChanged.connect(self._filter_changed)
+        self.status_filter.currentIndexChanged.connect(self._filter_changed)
+        self.empty = QLabel("没有待处理的发送任务")
+        layout.addWidget(self.empty)
+        self._last_rows = None
+        self.timer = QTimer(self)
+        self.timer.setInterval(500)
+        self.timer.timeout.connect(self.refresh)
+        self.timer.start()
+        self.refresh()
+        self.finished.connect(lambda: self.timer.stop())
+        self.finished.connect(self.deleteLater)
+
+    def _filter_changed(self):
+        self._last_rows = None
+        self.refresh()
+
+    def _batch(self, retry):
+        selected = sorted({index.row() for index in self.table.selectedIndexes()})
+        tasks = [self._visible_rows[index] for index in selected]
+        for ip, qid, component, label, status in tasks:
+            if retry:
+                self.window._retry_queue_component(ip, qid, component)
+            else:
+                self.window._cancel_queue_component(ip, qid, component)
+        self._last_rows = None
+        self.refresh()
+
+    def refresh(self):
+        rows = self.window._queue_rows()
+        device, status = self.device_filter.currentData(), self.status_filter.currentData()
+        def entry_for(row):
+            return next((e for e in self.window.offline_queue.get(row[0], []) if e.get("msg_id") == row[1]), {})
+        rows = [row for row in rows if (not status or row[4] == status)
+                and (not device or entry_for(row).get("recipient", row[0]) == device)]
+        self._visible_rows = rows
+        if rows == self._last_rows:
+            return
+        self._last_rows = rows
+        self.table.setRowCount(0)
+        labels = {"identity": "等待原设备／身份确认", "queued": "等待发送", "sending": "发送中", "error": "失败",
+                  "unconfirmed": "未确认接收", "cancelling": "正在撤销"}
+        for index, (ip, qid, component, label, status) in enumerate(rows):
+            self.table.insertRow(index)
+            for column, text in enumerate((self.window._queue_recipient(ip, qid), label, labels.get(status, status))):
+                cell = QTableWidgetItem(text)
+                cell.setToolTip(text)
+                self.table.setItem(index, column, cell)
+            retry = QPushButton("重试")
+            retry.setEnabled(status not in ("sending", "cancelling"))
+            retry.clicked.connect(lambda _=False, i=ip, q=qid, c=component: self._retry(i, q, c))
+            cancel = QPushButton("撤销")
+            cancel.setEnabled(status != "cancelling")
+            cancel.clicked.connect(lambda _=False, i=ip, q=qid, c=component: self._cancel(i, q, c))
+            self.table.setCellWidget(index, 3, retry)
+            self.table.setCellWidget(index, 4, cancel)
+        self.empty.setVisible(not rows)
+
+    def _retry(self, ip, qid, component):
+        self.window._retry_queue_component(ip, qid, component)
+        self.refresh()
+
+    def _cancel(self, ip, qid, component):
+        self.window._cancel_queue_component(ip, qid, component)
+        self.refresh()
 
 
 class ShortcutCapture(QLabel):
@@ -4974,6 +5626,13 @@ class SettingsDialog(QDialog):
             except Exception:
                 self._original_size = None
         self._build()
+        self._refresh_theme_controls()
+
+    def _refresh_theme_controls(self):
+        for widget in self.findChildren(QWidget):
+            if isinstance(widget, (QLabel, QCheckBox, QRadioButton)):
+                widget.setStyleSheet(re.sub(r"color\s*:[^;]+;", "", widget.styleSheet()))
+        self.setStyleSheet(STYLE)
 
     def _build(self):
         from PyQt6.QtWidgets import QScrollArea
@@ -4982,10 +5641,12 @@ class SettingsDialog(QDialog):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
         scroll = QScrollArea(self)
+        scroll.setObjectName("settingsScroll")
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         content = QWidget()
+        content.setObjectName("settingsContent")
         scroll.setWidget(content)
         outer.addWidget(scroll, 1)
 
@@ -5032,7 +5693,7 @@ class SettingsDialog(QDialog):
 
         t = THEMES.get(_load_theme_name(), THEMES["midnight"])
         rc = t["t1"]
-        rv_hint = QLabel("仅对文件生效；文字消息和截图始终自动接收。")
+        rv_hint = QLabel("文件和图片遵循此设置；纯文字消息自动接收。")
         rv_hint.setStyleSheet(f"color:{t['t4']}; font-size:11px;")
         rv_hint.setWordWrap(True)
         rv_lay.addWidget(rv_hint)
@@ -5099,7 +5760,7 @@ class SettingsDialog(QDialog):
             " border:1px solid #5B8CFF; }")
         size_row = QHBoxLayout()
         size_row.setSpacing(6)
-        size_row.addWidget(size_lbl)
+        wb_lay.addWidget(size_lbl)
         self._size_group = QButtonGroup(self)
         for (w_, h_) in PRESET_WIN_SIZES:
             b = QPushButton(f"{w_}×{h_}")
@@ -5195,6 +5856,8 @@ class SettingsDialog(QDialog):
         STYLE = build_style(THEMES.get(name, THEMES["midnight"]))
         for w in _App.instance().topLevelWidgets():
             w.setStyleSheet(STYLE)
+            if isinstance(w, SettingsDialog):
+                w._refresh_theme_controls()
 
     def _on_swatch_click(self, name: str):
         if name == self._selected_theme:
@@ -5752,6 +6415,30 @@ class ChatInput(QTextEdit):
         flush_text()
         return parts
 
+    def draft_state(self):
+        cur = self.textCursor()
+        return {"html": self.toHtml(), "images": dict(self._img_map),
+                "counter": self._img_counter, "position": cur.position(), "anchor": cur.anchor()}
+
+    def restore_draft(self, state):
+        self.reset()
+        if not state:
+            return
+        self._img_map = dict(state.get("images", {}))
+        self._img_counter = int(state.get("counter", 0))
+        self.setHtml(state.get("html", ""))
+        for name, path in self._img_map.items():
+            img = QImage(path)
+            if not img.isNull():
+                self.document().addResource(3, QUrl(name), img.scaledToWidth(min(160, img.width())))
+        missing = [path for path in self._img_map.values() if not Path(path).is_file()]
+        self.setToolTip("草稿图片已失效，请重新添加：" + "、".join(missing) if missing else "")
+        cur = self.textCursor()
+        limit = self.document().characterCount() - 1
+        cur.setPosition(max(0, min(int(state.get("anchor", 0)), limit)))
+        cur.setPosition(max(0, min(int(state.get("position", 0)), limit)), QTextCursor.MoveMode.KeepAnchor)
+        self.setTextCursor(cur)
+
     def reset(self):
         self.clear()
         self._img_map.clear()
@@ -6064,6 +6751,31 @@ class PeerItem(QWidget):
 
 
 # ----------------------------- 主窗口 -----------------------------
+def _scan_folder(path, progress, cancelled):
+    root = Path(path)
+    items, total = [], 0
+    last = time.monotonic()
+    def error(exc):
+        raise exc
+    for directory, _, filenames in os.walk(root, onerror=error, followlinks=False):
+        if cancelled.is_set():
+            return [], 0
+        for name in filenames:
+            if cancelled.is_set():
+                return [], 0
+            file = Path(directory) / name
+            if not file.is_file():
+                continue
+            total += file.stat().st_size
+            items.append({"type": "file", "path": str(file),
+                          "relpath": str(Path(root.name) / file.relative_to(root))})
+            if time.monotonic() - last >= 0.15:
+                progress(len(items), total)
+                last = time.monotonic()
+    progress(len(items), total)
+    return items, total
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -6080,6 +6792,12 @@ class MainWindow(QMainWindow):
             RECV_ROOT = DEFAULT_RECV_ROOT
             RECV_ROOT.mkdir(parents=True, exist_ok=True)
 
+        self._diagnostics = DailyLog(RECV_ROOT)
+        globals()["_diagnostic_sink"] = self._diagnostics
+        self._diagnostics.record("info", f"启动 BitFerry {__version__} / {platform.system()}")
+        self._background_jobs = {}
+        self._source_check_cache = {}
+        self._waiting_exit = False
         self.known = self._load_devices()      # ip -> {"name":...}
         self.online = {}                       # ip -> {"name","port","online"}
         self.history = self._load_history()    # ip -> [...] 持久, 供聊天记录弹窗用
@@ -6088,14 +6806,34 @@ class MainWindow(QMainWindow):
         self.unread = {}                       # device_key -> int 未读条数(按设备归并, 不随对端换 IP 而漏算)
         self._msg_seq = 0                      # 全局递增序号, 用于跨 IP 合并同一设备的消息时保持顺序
         self.offline_queue = load_offline_queue()  # ip -> [{send_items, record_parts, ts}]
-        self.staged_receives = {}              # ip -> [{parts, ts, name}] 待确认接收
+        self._recover_send_states()
+        self._offline_inflight = set()
+        self._drafts = {}
+        saved_drafts = _read_json_file(APP_DATA / "drafts.json", {})
+        if isinstance(saved_drafts, dict):
+            for key, value in saved_drafts.items():
+                if isinstance(value, list) and len(value) == 2 and isinstance(value[0], dict) and isinstance(value[1], list):
+                    self._drafts[key] = (value[0], [p for p in value[1] if isinstance(p, dict) and p.get("type") in ("file", "folder") and isinstance(p.get("path"), str)])
+                    for part in self._drafts[key][1]:
+                        if part.get("scan_state") == "scanning":
+                            part.update(scan_state="error", scan_error="上次扫描被中断，请重新添加文件夹")
+        self._draft_key = None
+        self._folder_scans = {}
+        self._text_controls = {}
+        self.staged_receives = _load_staged_receives()
+        for ip, entries in self.staged_receives.items():
+            self.known.setdefault(ip, {"name": entries[0].get("name", ip)})
         self._peer_list_state = {}             # 用于跳过无变化的重绘
         self._recv_meta = {}                   # recv_id -> {ip, label} 进行中的接收
         self._bubbles_by_id = {}               # msg_id -> Bubble 组件（用于取消时撤回气泡）
         self._send_ctrl: TransferControl | None = None   # 当前发送控制器
         self._send_units = {}    # unit_id -> {ctrl, ip, label, record} 在线按文件发送
 
+        self._staged_processing = set()
         self.signals = Signals()
+        self.signals.background_done.connect(self._on_background_done)
+        self._draft_writer = SerialWriter(_write_json_atomic, lambda error: self.signals.log.emit(error, "error"))
+        self.signals.staged_resolved.connect(self._on_staged_resolved)
         self.signals.peers_changed.connect(self._on_peers_change)
         self.signals.log.connect(self._append_log)
         self.signals.chat_in.connect(self._on_chat_in)
@@ -6106,9 +6844,13 @@ class MainWindow(QMainWindow):
         self.signals.recv_progress.connect(self._on_recv_progress)
         self.signals.send_unit_progress.connect(self._on_send_unit_progress)
         self.signals.send_unit_result.connect(self._on_send_unit_result)
+        self.signals.text_result.connect(self._on_text_result)
         self.signals.recv_done.connect(self._on_recv_done)
         self.signals.recv_started.connect(self._on_recv_started)
         self.signals.recv_cancelled.connect(self._on_recv_cancelled)
+        self.signals.receiver_status.connect(self._on_receiver_status)
+        self.signals.folder_progress.connect(self._on_folder_progress)
+        self.signals.folder_done.connect(self._on_folder_done)
 
         # macOS: 点击 Dock 图标时 QApplication 会发 ApplicationActive 状态,
         # 借此将被 hide() 隐藏的窗口还原到前台。
@@ -6130,6 +6872,11 @@ class MainWindow(QMainWindow):
         if not restored:
             self.resize(*load_window_size())
         self._build_ui()
+        self._draft_timer = QTimer(self)
+        self._draft_timer.setSingleShot(True)
+        self._draft_timer.setInterval(500)
+        self._draft_timer.timeout.connect(self._save_drafts)
+        self.input.textChanged.connect(self._draft_timer.start)
         self.setStyleSheet(STYLE)
         self._force_quit = False
         self._tray_notified = False
@@ -6143,7 +6890,6 @@ class MainWindow(QMainWindow):
             self.hostname, lambda p: self.signals.peers_changed.emit(p))
         self.discovery.start()
         # 向历史已知设备发单播，加速双向发现（解决 Windows 防火墙拦截广播的问题）
-        self.discovery.ping_known(list(self.known.keys()))
         self.receiver = Receiver(
             on_file=self._on_file_received,
             on_chat=lambda n, ip, k, p: self.signals.chat_in.emit(n, ip, k, p),
@@ -6154,7 +6900,8 @@ class MainWindow(QMainWindow):
             on_recv_done=lambda rid: self.signals.recv_done.emit(rid),
             on_recv_cancelled=lambda rid: self.signals.recv_cancelled.emit(rid),
             on_peer_seen=lambda ip, name, uid, port: self.discovery.note_active_peer(
-                ip, name, port, uid))
+                ip, name, port, uid),
+            on_status=lambda ready, reason: self.signals.receiver_status.emit(ready, reason))
         self.receiver.start()
 
         # 手机网页版: 手机浏览器扫码接入, 作为虚拟设备出现在设备列表
@@ -6171,6 +6918,21 @@ class MainWindow(QMainWindow):
 
         # 启动后静默检查更新（延迟，避免拖慢启动）
         QTimer.singleShot(3000, lambda: self.action_check_update(manual=False))
+
+    def _on_receiver_status(self, ready, reason):
+        self.discovery.set_receiving(ready)
+        self.recv_status_lbl.setText("● 可以接收文件" if ready else
+                                    ("⚠ 无法接收文件\n端口被占用或无访问权限" if reason else "接收服务已停止"))
+        self.recv_status_lbl.setToolTip(reason or (f"接收端口：{TRANSFER_PORT}" if ready else "接收服务已停止"))
+        self.btn_retry_receiver.setVisible(not ready)
+        self.btn_retry_receiver.setEnabled(True)
+        if ready:
+            self.discovery.ping_known(list(self.known.keys()))
+
+    def _retry_receiver(self):
+        self.recv_status_lbl.setText("正在重试接收服务…")
+        self.btn_retry_receiver.setEnabled(False)
+        self.receiver.start()
 
     # ---------- 系统托盘 ----------
     def _make_icon(self):
@@ -6338,6 +7100,10 @@ class MainWindow(QMainWindow):
         sig.progress.connect(_progress)
 
         def _done():
+            if self._transfers_busy():
+                dlg.setLabelText("等待所有传输和后台处理完成后安装更新…")
+                QTimer.singleShot(500, _done)
+                return
             dlg.close()
             try:
                 if platform.system() == "Darwin":
@@ -6353,8 +7119,12 @@ class MainWindow(QMainWindow):
             # 不释放, 更新脚本的等待循环就会一直卡住(残留命令行窗口、更新不生效)。
             # 先落盘再 os._exit 立即让出进程, 交给更新脚本完成替换并重启。
             try:
+                self._save_drafts()
+                self._draft_writer.flush()
                 self._save_history()
                 self._save_devices()
+                self._append_log("准备安装更新并重启", "info")
+                self._diagnostics.flush()
             except Exception:
                 pass
             os._exit(0)
@@ -6385,8 +7155,8 @@ class MainWindow(QMainWindow):
 
     def _tray_quit(self):
         self._force_quit = True
-        self.close()
-        QApplication.quit()
+        if self.close():
+            QApplication.quit()
 
     def _tray_icon_with_badge(self, count: int) -> QIcon:
         """在托盘图标右上角叠加未读数角标。"""
@@ -6497,16 +7267,32 @@ class MainWindow(QMainWindow):
             pass
 
     # ---------- 持久化 ----------
-    def _load_history(self):
-        h = _read_json_file(HISTORY_FILE, {})
+    def _read_legacy_history(self):
+        h = _read_json_file(HISTORY_FILE, None)
+        if not isinstance(h, dict):
+            h = _read_json_file(HISTORY_FILE.with_suffix(".bak.json"), {})
         return h if isinstance(h, dict) else {}
 
-    def _save_history(self):
+    def _load_history(self):
         try:
-            HISTORY_FILE.write_text(
-                json.dumps(self.history, ensure_ascii=False), encoding="utf-8")
-        except Exception as e:
-            _log_persist_error("保存聊天记录", e)
+            return HistoryStore(HISTORY_FILE.with_suffix(".sqlite3"), self._read_legacy_history)
+        except Exception as exc:
+            _log_persist_error("打开历史数据库，暂用原记录", exc)
+            return self._read_legacy_history()
+
+    def _save_history(self):
+        if isinstance(self.history, HistoryStore):
+            try:
+                return self.history.save()
+            except Exception as exc:
+                self._append_log(f"聊天记录保存失败，当前记录仍保留在内存：{exc}", "error")
+                return False
+        previous = _read_json_file(HISTORY_FILE, None)
+        if isinstance(previous, dict):
+            if not _write_json_atomic(HISTORY_FILE.with_suffix(".bak.json"), previous):
+                self._append_log("聊天记录备份失败，已保留原文件", "error")
+                return False
+        return _write_json_atomic(HISTORY_FILE, self.history)
 
     def _load_devices(self):
         d = _read_json_file(DEVICES_FILE, {})
@@ -6563,6 +7349,18 @@ class MainWindow(QMainWindow):
         self.btn_settings.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_settings.clicked.connect(self.action_settings)
         sb.addWidget(self.btn_settings)
+        self.btn_send_queue = QPushButton("发送队列")
+        self.btn_send_queue.setObjectName("miniBtn")
+        self.btn_send_queue.clicked.connect(self.action_send_queue)
+        sb.addWidget(self.btn_send_queue)
+        self.btn_cancel_exit = QPushButton("取消等待退出")
+        self.btn_cancel_exit.clicked.connect(self._cancel_wait_exit)
+        self.btn_cancel_exit.hide()
+        sb.addWidget(self.btn_cancel_exit)
+        maintenance = QPushButton("日志与存储")
+        maintenance.setObjectName("miniBtn")
+        maintenance.clicked.connect(self.action_diagnostics)
+        sb.addWidget(maintenance)
 
         selfCard = QFrame()
         selfCard.setObjectName("selfCard")
@@ -6578,6 +7376,14 @@ class MainWindow(QMainWindow):
             lambda e: self.action_rename_device())
         sc.addWidget(self.self_name_lbl)
         sc.addWidget(self._lbl(self.local_ip, "selfIp"))
+        self.recv_status_lbl = self._lbl("正在启动接收服务…", "selfIp")
+        self.recv_status_lbl.setWordWrap(True)
+        sc.addWidget(self.recv_status_lbl)
+        self.btn_retry_receiver = QPushButton("重试接收")
+        self.btn_retry_receiver.setObjectName("miniBtn")
+        self.btn_retry_receiver.clicked.connect(self._retry_receiver)
+        self.btn_retry_receiver.hide()
+        sc.addWidget(self.btn_retry_receiver)
         sb.addWidget(selfCard)
 
         # 接收目录卡片
@@ -6723,7 +7529,17 @@ class MainWindow(QMainWindow):
         self.chat_layout.setSpacing(2)
         self.chat_layout.addStretch()
         self.chat_scroll.setWidget(self.chat_canvas)
+        browse = QHBoxLayout()
+        self._older_messages = QPushButton("加载更早消息")
+        self._older_messages.clicked.connect(self._load_older_session)
+        latest = QPushButton("回到最新")
+        latest.clicked.connect(lambda: self._render_session(self.current_ip))
+        browse.addWidget(self._older_messages)
+        browse.addStretch()
+        browse.addWidget(latest)
+        cl.addLayout(browse)
         cl.addWidget(self.chat_scroll, 1)
+        self.chat_scroll.verticalScrollBar().valueChanged.connect(self._on_chat_scroll)
 
         # 输入区(待发内容直接显示在输入框里: 截图缩略图内嵌, 文件以 chip 行紧贴显示)
         compose = QFrame()
@@ -6868,20 +7684,51 @@ class MainWindow(QMainWindow):
             self._delete_peer(ip)
 
     def _delete_peer(self, ip):
-        if ip.startswith("web:") and hasattr(self, "webbridge"):
-            self.webbridge.forget(ip)     # 否则会话内快照会让它重新出现
-        self.unread.pop(self._device_key(ip), None)   # 先按设备清未读(需 known 仍在)
-        if ip in self.known:
-            del self.known[ip]
-            self._save_devices()
-        if ip in self.history:
-            del self.history[ip]
-            self._save_history()
-        if ip in self.session:
-            del self.session[ip]
-        if self.current_ip == ip:
+        identity = self._device_key(ip)
+        aliases = {addr for addr in self.known if self._device_key(addr) == identity} | {ip}
+        tasks = [(addr, e) for addr, entries in self.offline_queue.items() for e in entries
+                 if e.get("recipient") == identity or (not e.get("recipient") and addr in aliases)]
+        if tasks:
+            if any(addr == a and qid == e.get("msg_id") for a, e in tasks
+                   for addr, qid, component in self._offline_inflight):
+                QMessageBox.information(self, "设备仍有传输", "请先在发送队列中停止传输，再删除设备。")
+                return
+            box = QMessageBox(self)
+            box.setWindowTitle("删除设备")
+            box.setText(f"该设备还有 {len(tasks)} 个待发任务。删除设备时如何处理？")
+            discard = box.addButton("同时撤销任务", QMessageBox.ButtonRole.DestructiveRole)
+            keep = box.addButton("保留任务", QMessageBox.ButtonRole.ActionRole)
+            box.addButton(QMessageBox.StandardButton.Cancel)
+            box.exec()
+            if box.clickedButton() not in (discard, keep):
+                return
+            if box.clickedButton() == discard:
+                replacement = {addr: [e for e in entries if (addr, e) not in tasks]
+                               for addr, entries in self.offline_queue.items()}
+                if not save_offline_queue(replacement):
+                    QMessageBox.warning(self, "删除未完成", "撤销任务未能保存，设备和任务均已保留。")
+                    return
+                self.offline_queue = replacement
+        for addr in aliases:
+            if addr.startswith("web:") and hasattr(self, "webbridge"):
+                self.webbridge.forget(addr)
+            self.known.pop(addr, None)
+            if addr in self.history:
+                del self.history[addr]
+            self.session.pop(addr, None)
+        self.unread.pop(identity, None)
+        self._drafts.pop(identity, None)
+        if self.current_ip in aliases:
             self.current_ip = None
+            self._draft_key = None
+            self.input.reset()
+            self.pending.clear()
             self.right.setCurrentIndex(0)
+        self._save_drafts()
+        self._append_log(f"删除设备：{identity}", "info")
+        self._save_devices()
+        self._save_history()
+        self._peer_list_state = {}
         self._rebuild_peer_list()
 
     # ---------- 设备列表 ----------
@@ -6913,8 +7760,9 @@ class MainWindow(QMainWindow):
         now_online = set(ip for ip, p in peers.items() if p.get("online"))
         just_online = now_online - prev_online
         for ip in just_online:
-            if ip in self.offline_queue and self.offline_queue[ip]:
-                QTimer.singleShot(500, lambda i=ip: self._flush_offline_queue(i))
+            for queued_ip, entries in self.offline_queue.items():
+                if any(e.get("recipient") == self._device_key(ip) for e in entries):
+                    QTimer.singleShot(500, lambda i=queued_ip: self._flush_offline_queue(i))
 
     def _device_key(self, ip):
         """同一台机器的多个 IP 归并到一个 key：优先用对端上报的 uid，
@@ -7011,10 +7859,67 @@ class MainWindow(QMainWindow):
             self.peer_list.setCurrentItem(select_item)
         self.empty_hint.setVisible(len(all_ips) == 0)
 
+    def _run_background(self, key, work, done):
+        if key in self._background_jobs:
+            return
+        self._background_jobs[key] = done
+        def worker():
+            try:
+                result, error = work(), ""
+            except Exception as exc:
+                import traceback
+                result, error = None, traceback.format_exc()
+            self.signals.background_done.emit(key, result, error)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_background_done(self, key, result, error):
+        callback = self._background_jobs.pop(key, None)
+        if error:
+            self._append_log(error, "error")
+        if callback:
+            callback(result, error)
+
+    def _save_drafts(self):
+        if self._draft_key is not None:
+            self._drafts[self._draft_key] = (self.input.draft_state(), list(self.pending))
+        # HTML and attachment dictionaries are copied before the worker serializes them.
+        snapshot = {key: (dict(state, images=dict(state.get("images", {}))),
+                    [dict(part, send_items=[dict(x) for x in part.get("send_items", [])]) for part in pending])
+                    for key, (state, pending) in self._drafts.items()}
+        if hasattr(self, "_draft_writer"):
+            self._draft_writer.submit(APP_DATA / "drafts.json", snapshot)
+            return True
+        return _write_json_atomic(APP_DATA / "drafts.json", snapshot)
+
+    def _switch_draft(self, key):
+        if key == self._draft_key:
+            return
+        if self._draft_key is not None:
+            self._drafts[self._draft_key] = (self.input.draft_state(), list(self.pending))
+        elif not self.input.document().isEmpty() or self.pending:
+            # 尚未选设备时粘贴的内容归入第一次选择的会话。
+            self._draft_key = key
+            return
+        state, pending = self._drafts.get(key, (None, []))
+        try:
+            self.input.restore_draft(state)
+        except (ValueError, TypeError, KeyError):
+            self.input.reset()
+            self._append_log("该会话草稿格式异常，已跳过文字恢复", "error")
+        self.pending = list(pending)
+        self._draft_key = key
+        self._refresh_chips()
+        self._save_drafts()
+
     def _on_peer_selected(self, cur, _prev):
         if not cur:
             return
         ip = cur.data(Qt.ItemDataRole.UserRole)
+        key = self._device_key(ip)
+        if self.current_ip and self._device_key(self.current_ip) == key:
+            # 同一设备刚上报 UID / 改名 / 切换 IP，保留当前输入而不是当作新会话清空。
+            self._draft_key = key
+        self._switch_draft(key)
         self.current_ip = ip
         self.right.setCurrentIndex(1)
         dk = self._device_key(ip)
@@ -7064,20 +7969,48 @@ class MainWindow(QMainWindow):
             if w:
                 w.deleteLater()
 
-    def _render_session(self, ip):
-        """只渲染本次程序运行期间与该设备的消息(新打开对话框是空的)。
-        按设备(而非单个 IP)聚合：对端换 IP/多网段时，分散落在不同 IP 下的
-        本次会话消息也能合并显示，按全局序号还原先后顺序。"""
-        self._clear_chat_canvas()
+    def _session_count(self, ip):
         key = self._device_key(ip)
-        msgs = []
-        for k, lst in self.session.items():
-            if self._device_key(k) == key:
-                msgs.extend(lst)
-        msgs.sort(key=lambda m: m.get("seq", 0))
-        for m in msgs:
-            self._add_bubble_widget(m)
-        QTimer.singleShot(30, self._scroll_bottom)
+        return sum(len(records) for peer, records in self.session.items() if self._device_key(peer) == key)
+
+    def _session_messages(self, ip):
+        key = self._device_key(ip)
+        messages = [m for peer, records in self.session.items() if self._device_key(peer) == key for m in records]
+        return sorted(messages, key=lambda m: m.get("seq", 0))
+
+    def _on_chat_scroll(self, value):
+        if value == 0 and not getattr(self, "_rendering_session", False) and self.chat_scroll.underMouse():
+            self._load_older_session()
+
+    def _load_older_session(self):
+        if self.current_ip and getattr(self, "_session_start", 0) > 0:
+            self._render_session(self.current_ip, older=True)
+
+    def _render_session(self, ip, older=False):
+        if not ip:
+            return
+        messages = self._session_messages(ip)
+        if older:
+            end = self._session_end
+            start = max(0, self._session_start - 100)
+            end = min(end, start + 500)
+        else:
+            end, start = len(messages), max(0, len(messages) - 100)
+        bar = self.chat_scroll.verticalScrollBar()
+        old_max, old_value = bar.maximum(), bar.value()
+        self._rendering_session = True
+        self._building_session = True
+        self._clear_chat_canvas()
+        self._session_start, self._session_end = start, end
+        for record in messages[start:end]:
+            self._add_bubble_widget(record)
+        self._building_session = False
+        self._older_messages.setText("加载更早消息")
+        self._older_messages.setVisible(start > 0)
+        def restore():
+            bar.setValue(max(0, old_value + bar.maximum() - old_max) if older else bar.maximum())
+            self._rendering_session = False
+        QTimer.singleShot(0, restore)
 
     def _add_divider(self, text):
         d = QLabel(text)
@@ -7086,15 +8019,36 @@ class MainWindow(QMainWindow):
         self.chat_layout.insertWidget(self.chat_layout.count() - 1, d)
 
     def _add_bubble_widget(self, m):
+        if not getattr(self, "_building_session", False) and self.current_ip:
+            total = self._session_count(self.current_ip)
+            if getattr(self, "_session_end", total) < total - 1:
+                self._older_messages.setText("有新消息 · 点击回到最新查看")
+                return None
         b = Bubble(m["kind"], m["payload"], m["mine"], m["ts"], m["name"],
-                   m.get("pending", False))
+                   m.get("pending", False), m.get("delivery"))
         self.chat_layout.insertWidget(self.chat_layout.count() - 1, b)
+        if not getattr(self, "_building_session", False):
+            # Keep a bounded set of widgets even when the app stays open for days.
+            while self.chat_layout.count() > 501:
+                old = self.chat_layout.takeAt(0).widget()
+                if old:
+                    for key, widget in list(self._bubbles_by_id.items()):
+                        if widget is old:
+                            self._bubbles_by_id.pop(key, None)
+                    old.deleteLater()
+            total = self._session_count(self.current_ip) if self.current_ip else 0
+            self._session_end = total
+            self._session_start = max(0, total - (self.chat_layout.count() - 1))
+            self._older_messages.setVisible(self._session_start > 0)
         mid = m.get("msg_id")
         if mid:
             self._bubbles_by_id[mid] = b
+            b.set_retry(lambda mid=mid: self._retry_message(mid))
         return b
 
     def _scroll_bottom(self):
+        if self.current_ip and getattr(self, "_session_end", self._session_count(self.current_ip)) < self._session_count(self.current_ip):
+            return
         sb = self.chat_scroll.verticalScrollBar()
         sb.setValue(sb.maximum())
 
@@ -7107,7 +8061,10 @@ class MainWindow(QMainWindow):
             rec["pending"] = True
         if msg_id:
             rec["msg_id"] = msg_id
-        self.history.setdefault(ip, []).append(rec)
+        if isinstance(self.history, HistoryStore):
+            self.history.append(ip, rec)
+        else:
+            self.history.setdefault(ip, []).append(rec)
         self.session.setdefault(ip, []).append(rec)   # 本次会话
         self._save_history()
         return rec
@@ -7139,6 +8096,7 @@ class MainWindow(QMainWindow):
             self.staged_receives.setdefault(cip, []).append({
                 "name": sender_name, "parts": parts, "ts": now_hm()
             })
+            self._save_staged_receives()
             self._update_staged_banner()
             self._notify(sender_name, sender_ip, "batch", payload)
             return
@@ -7209,7 +8167,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         # 4) 状态栏文字(若正看着别的设备)
-        self._append_log(f"{sender_name}: {preview}", "recv")
+        self._append_log(f"收到消息：设备={sender_name} 类型={kind}", "recv")
         # 5) 按设置: 收到消息后将本应用置顶并聚焦
         if load_focus_on_recv():
             self._bring_to_front()
@@ -7235,16 +8193,27 @@ class MainWindow(QMainWindow):
                 w.deleteLater()
         for idx, it in enumerate(self.pending):
             if it["type"] == "folder":
-                label = f"📁 {it['name']}（{it['count']}）"
+                label = f"📁 {it['name']} · {it['count']} 个 · {human_size(it.get('size', 0))}"
+                if it.get("scan_state") == "scanning":
+                    label += " · 扫描中…"
+                elif it.get("scan_state") == "error":
+                    label += " · 扫描失败"
             else:
                 label = f"📄 {it['name']}"
+            if not Path(it["path"]).exists():
+                label += " · 文件已失效"
             chip = AttachChip(label, lambda _=False, i=idx: self._remove_pending(i))
             self.chip_layout.insertWidget(self.chip_layout.count() - 1, chip)
         self.chip_holder.setVisible(len(self.pending) > 0)
+        if hasattr(self, "_draft_timer"):
+            self._draft_timer.start()
 
     def _remove_pending(self, idx):
         if 0 <= idx < len(self.pending):
-            self.pending.pop(idx)
+            item = self.pending.pop(idx)
+            scan = self._folder_scans.pop(item.get("scan_id"), None)
+            if scan:
+                scan[1].set()
             self._refresh_chips()
 
     def _attach_image(self, path):
@@ -7256,15 +8225,44 @@ class MainWindow(QMainWindow):
         for p in paths:
             pp = Path(p)
             if pp.is_dir():
-                files = [f for f in pp.rglob("*") if f.is_file()]
-                self.pending.append({"type": "folder", "path": str(pp),
-                                     "name": pp.name, "count": len(files)})
+                scan_id = uuid.uuid4().hex
+                item = {"type": "folder", "path": str(pp), "name": pp.name,
+                        "count": 0, "size": 0, "scan_state": "scanning", "scan_id": scan_id}
+                self.pending.append(item)
+                cancel = threading.Event()
+                self._folder_scans[scan_id] = (item, cancel)
+                def worker(path=pp, sid=scan_id, stop=cancel):
+                    try:
+                        files, size = _scan_folder(path,
+                            lambda n, size: self.signals.folder_progress.emit(sid, n, size), stop)
+                        self.signals.folder_done.emit(sid, files, size, "")
+                    except Exception as e:
+                        self.signals.folder_done.emit(sid, [], 0, str(e))
+                threading.Thread(target=worker, daemon=True).start()
             elif pp.suffix.lower() in IMAGE_EXTS:
-                # 图片文件也内嵌显示
                 self.input.add_inline_image(str(pp), at_end=True)
             else:
                 self.pending.append({"type": "file", "path": str(pp), "name": pp.name})
         self._refresh_chips()
+
+    def _on_folder_progress(self, scan_id, count, size):
+        scan = self._folder_scans.get(scan_id)
+        if scan:
+            scan[0].update(count=count, size=size)
+            if any(it is scan[0] for it in self.pending):
+                self._refresh_chips()
+
+    def _on_folder_done(self, scan_id, files, size, error):
+        scan = self._folder_scans.pop(scan_id, None)
+        if not scan or scan[1].is_set():
+            return
+        item = scan[0]
+        item.update(scan_state="error" if error else "ready", scan_error=error,
+                    send_items=files, count=len(files), size=size)
+        if error:
+            self._append_log(f"扫描 {item['name']} 失败：{error}", "error")
+        if any(it is item for it in self.pending):
+            self._refresh_chips()
 
     def action_attach_file(self):
         paths, _ = QFileDialog.getOpenFileNames(self, "选择要发送的文件")
@@ -7328,125 +8326,266 @@ class MainWindow(QMainWindow):
                     "send_items": [{"type": "file", "path": it["path"]}],
                     "record": rec, "label": it["name"]})
             elif it["type"] == "folder":
-                root = Path(it["path"])
-                files = [f for f in root.rglob("*") if f.is_file()]
-                sitems = []
-                for f in files:
-                    rel = str(Path(root.name) / f.relative_to(root))
-                    sitems.append({"type": "file", "path": str(f), "relpath": rel})
-                rec = {"type": "file",
-                       "name": f"{it['name']}/（{it['count']} 个文件）",
-                       "size": 0, "path": str(root)}
-                file_units.append({"send_items": sitems, "record": rec,
-                                   "label": it["name"]})
+                if it.get("scan_state") != "ready":
+                    QMessageBox.information(self, "文件夹尚未就绪", "请等待扫描完成；扫描失败时请移除后重新添加。")
+                    return None
+                if not it.get("send_items"):
+                    QMessageBox.information(self, "空文件夹", f"{it['name']} 中没有可发送的文件。")
+                    return None
+                rec = {"type": "file", "name": f"{it['name']}/（{it['count']} 个文件）",
+                       "size": it["size"], "path": it["path"]}
+                file_units.append({"send_items": it["send_items"], "record": rec, "label": it["name"]})
         return text_items, text_record, file_units
 
+    def _source_key(self, items):
+        return tuple((item.get("type"), item.get("path")) for item in items if item.get("type") in ("file", "image"))
+
+    def _prepare_source_check(self, items, callback):
+        key = self._source_key(items)
+        if len(key) < 64 or key in self._source_check_cache:
+            return True
+        job = "sources:" + str(hash(key))
+        def work():
+            versions = {}
+            last = time.monotonic()
+            for count, (_, path) in enumerate(key, 1):
+                try:
+                    versions[path] = self._source_version(path)
+                except OSError:
+                    versions[path] = None
+                if time.monotonic() - last > .5:
+                    self.signals.log.emit(f"检查附件：{count}/{len(key)}", "info")
+                    last = time.monotonic()
+            return versions
+        def done(result, error):
+            if not error:
+                self._source_check_cache[key] = result
+                callback()
+        self._append_log(f"正在后台检查 {len(key)} 个附件…", "info") if job not in self._background_jobs else None
+        self._run_background(job, work, done)
+        return False
+
+    @staticmethod
+    def _source_version(path):
+        stat = Path(path).stat()
+        if not Path(path).is_file():
+            raise FileNotFoundError(path)
+        return [stat.st_size, stat.st_mtime_ns]
+
+    def _check_sources(self, items, interactive=False):
+        updates, changed, missing = [], [], []
+        cached = self._source_check_cache.pop(self._source_key(items), None)
+        for item in items:
+            if item.get("type") not in ("file", "image"):
+                continue
+            try:
+                version = cached.get(item["path"]) if cached is not None else self._source_version(item["path"])
+                if version is None:
+                    raise FileNotFoundError(item["path"])
+            except (OSError, KeyError):
+                missing.append(item.get("path", "未知文件"))
+                continue
+            if item.get("source_version") != version:
+                changed.append(item["path"])
+            updates.append((item, version))
+        if missing:
+            if interactive:
+                QMessageBox.warning(self, "源文件已失效", "以下文件已移动、删除或无法读取，请重新添加：\n" + "\n".join(missing[:8]))
+            return False
+        if changed:
+            if not interactive:
+                return False
+            answer = QMessageBox.question(self, "确认发送当前文件",
+                "以下文件已变化，或旧任务没有记录原版本。是否发送当前版本？\n" + "\n".join(changed[:8]))
+            if answer != QMessageBox.StandardButton.Yes:
+                return False
+            for item, version in updates:
+                item["source_version"] = version
+        return True
+
     def action_send(self):
-        """文字+内嵌图片作为一条消息立即显示; 每个文件/文件夹独立进入发送队列,
-        各自可暂停/取消, 传完才在聊天里显示, 取消/失败则显示失败说明。"""
+        if getattr(self, "_waiting_exit", False):
+            self._append_log("正在等待传输结束后退出，已暂停新发送", "info")
+            return
         ip = self.current_ip
         if not ip:
             QMessageBox.information(self, "选择设备", "请先在左侧选择一台设备。")
             return
-
-        offline = not self._peer_online(ip)
-
-        # ---------- 离线: 文字乐观显示(⏳), 文件入队, 上线后按统一方式补发 ----------
-        if offline:
-            built = self._build_send_units()
-            if built is None:
-                return
-            text_items, text_record, file_units = built
-            self.input.reset()
-            self.pending.clear()
-            self._refresh_chips()
-            msg_id = str(uuid.uuid4())
-            if text_items:
-                rec = self._store_msg(
-                    ip, "batch", json.dumps(text_record, ensure_ascii=False),
-                    True, self.hostname, pending=True, msg_id=msg_id)
-                if self.current_ip == ip:
-                    self._add_bubble_widget(rec)
-                    QTimer.singleShot(20, self._scroll_bottom)
-            # 文件不再乐观显示, 上线后真正送达时才出现(失败则给说明)
-            self.offline_queue.setdefault(ip, []).append({
-                "text_items": text_items,
-                "text_record": text_record,
-                "file_units": file_units,
-                "msg_id": msg_id,
-                "ts": now_hm(),
-            })
-            save_offline_queue(self.offline_queue)
-            self._peer_list_state = {}
-            self._rebuild_peer_list()
-            return
-
-        # ---------- 在线: 文字单元立即显示, 文件单元进队列逐个发送 ----------
         built = self._build_send_units()
         if built is None:
             return
         text_items, text_record, file_units = built
-        port = self._peer_port(ip)
-
-        # 清空输入区
+        all_items = text_items + [item for unit in file_units for item in unit["send_items"]]
+        draft_html = self.input.toHtml()
+        pending_paths = [p.get("path") for p in self.pending]
+        def validated_send():
+            if self.current_ip == ip and self.input.toHtml() == draft_html and [p.get("path") for p in self.pending] == pending_paths:
+                self.action_send()
+            else:
+                self._source_check_cache.pop(self._source_key(all_items), None)
+                self._append_log("附件检查完成，但会话或草稿已变化，请重新点击发送", "info")
+        if not self._prepare_source_check(all_items, validated_send):
+            return
+        cached = self._source_check_cache.pop(self._source_key(all_items), None)
+        try:
+            for item in all_items:
+                if item.get("type") in ("file", "image"):
+                    version = cached.get(item["path"]) if cached is not None else self._source_version(item["path"])
+                    if version is None:
+                        raise FileNotFoundError(item["path"])
+                    item["source_version"] = version
+        except OSError as exc:
+            QMessageBox.warning(self, "附件已失效", f"请重新添加无法读取的附件：{exc}")
+            return
+        msg_id = str(uuid.uuid4())
+        for unit in file_units:
+            unit["transfer_id"] = str(uuid.uuid4())
+        entry = {"recipient": self._device_key(ip), "recipient_name": self._peer_name(ip), "text_items": text_items, "text_record": text_record,
+                 "file_units": file_units, "msg_id": msg_id, "ts": now_hm()}
+        entries = self.offline_queue.setdefault(ip, [])
+        entries.append(entry)
+        if not save_offline_queue(self.offline_queue):
+            entries.remove(entry)
+            QMessageBox.warning(self, "未能保存发送任务", "请检查磁盘空间和目录权限，输入内容已保留。")
+            return
+        if text_items:
+            self._ensure_send_record(ip, msg_id, text_record, text_items)
+        for unit in file_units:
+            self._ensure_send_record(ip, unit["transfer_id"], [unit["record"]], unit["send_items"])
+        self._append_log(f"创建发送任务：{msg_id} 接收设备={entry.get('recipient')} 文字图片项={len(text_items)} 文件任务={len(file_units)}", "send")
         self.input.reset()
         self.pending.clear()
         self._refresh_chips()
+        self._peer_list_state = {}
+        self._rebuild_peer_list()
+        if self._peer_online(ip):
+            self._flush_offline_queue(ip)
 
-        # 1) 文字 + 内嵌图片: 立即显示一条消息, 后台静默发送
-        if text_items:
-            rec = self._store_msg(ip, "batch",
-                                  json.dumps(text_record, ensure_ascii=False),
-                                  True, self.hostname)
-            if self.current_ip == ip:
-                self._add_bubble_widget(rec)
-                QTimer.singleShot(20, self._scroll_bottom)
-            self._send_text_unit(ip, port, text_items)
+    def _recover_send_states(self):
+        if isinstance(self.history, HistoryStore):
+            self.history.recover()
+            return
+        changed = False
+        for records in self.history.values():
+            for record in records:
+                if record.get("delivery") in ("sending", "cancelling"):
+                    record["delivery"] = "unconfirmed"
+                    record["pending"] = False
+                    changed = True
+        if changed:
+            self._save_history()
 
-        # 2) 文件/文件夹: 进入顶部队列逐个发送
-        self._start_file_units(ip, port, file_units)
+    def _ensure_send_record(self, ip, msg_id, parts, send_items=None):
+        if isinstance(self.history, HistoryStore):
+            if self.history.find(msg_id)[1] is not None:
+                return
+        elif any(m.get("msg_id") == msg_id for m in self.history.get(ip, [])):
+            return
+        rec = self._store_msg(ip, "batch", json.dumps(parts, ensure_ascii=False),
+                              True, self.hostname, pending=True, msg_id=msg_id)
+        rec["delivery"] = "queued"
+        # 重试数据跟随历史保存，即使撤销队列后仍可重新发送。
+        rec["recipient"] = self._device_key(ip)
+        rec["retry_parts"] = parts
+        rec["retry_items"] = send_items or parts
+        self._save_history()
+        if self.current_ip == ip:
+            self._add_bubble_widget(rec)
+            QTimer.singleShot(20, self._scroll_bottom)
 
-    def _send_text_unit(self, ip, port, text_items):
-        """后台静默发送文字+内嵌图片这一条消息(气泡已在别处显示)。"""
+    def _set_message_delivery(self, ip, msg_id, status, reason=""):
+        if isinstance(self.history, HistoryStore):
+            rec = self.history.find(msg_id)[1]
+            records_in_history = [rec] if rec else []
+        else:
+            records_in_history = self.history.get(ip, [])
+        for records in (records_in_history, self.session.get(ip, [])):
+            for rec in records:
+                if rec.get("msg_id") == msg_id:
+                    rec["delivery"] = status
+                    rec["pending"] = status == "queued"
+                    rec["delivery_reason"] = reason
+        self._save_history()
+        bubble = self._bubbles_by_id.get(msg_id)
+        if bubble:
+            bubble.set_delivery(status, reason)
+        self.signals.delivery_changed.emit()
+
+    def _send_text_unit(self, ip, port, text_items, msg_id=None, queue_id="", target_ip=None):
         if not text_items:
             return
-        if ip.startswith("web:"):    # 手机网页设备: 走 SSE 推送, 无需 TCP
-            self.webbridge.push_desktop_parts(ip[4:], text_items, self.hostname)
+        msg_id = msg_id or str(uuid.uuid4())
+        self._text_controls[msg_id] = TransferControl()
+        self._set_message_delivery(ip, msg_id, "sending")
+        if ip.startswith("web:"):
+            try:
+                self.webbridge.push_desktop_parts(ip[4:], text_items, self.hostname)
+                self.signals.text_result.emit(ip, msg_id, "offered", "", queue_id)
+            except Exception as e:
+                self.signals.text_result.emit(ip, msg_id, "error", str(e), queue_id)
             return
 
+        target_ip = target_ip or self._canonical_ip(ip)
+        control = self._text_controls[msg_id]
         def do():
-            send_batch(text_items, ip, port, self.hostname,
-                       lambda m, k="send": self.signals.log.emit(m, k))
+            errors = []
+            def log(m, k="send"):
+                if k == "error":
+                    errors.append(m)
+                self.signals.log.emit(m, k)
+            status = send_batch(text_items, target_ip, port, self.hostname, log,
+                                ctrl=control, transfer_id=msg_id)
+            self.signals.text_result.emit(ip, msg_id, status, errors[-1] if errors else "", queue_id)
         threading.Thread(target=do, daemon=True).start()
 
-    def _start_file_units(self, ip, port, file_units):
+    def _on_text_result(self, ip, msg_id, status, reason, queue_id):
+        self._text_controls.pop(msg_id, None)
+        self._append_log(f"文字/图片任务结束：{msg_id} 状态={status} 原因={reason}", "send")
+        if queue_id and not self._finish_offline_component(ip, queue_id, "text", status):
+            status, reason = "unconfirmed", "传输已结束，但任务状态未能保存，请检查磁盘后重试处理"
+        self._set_message_delivery(ip, msg_id, status, reason)
+
+    def _start_file_units(self, ip, port, file_units, queue_id="", target_ip=None):
         """文件/文件夹单元: 注册到顶部队列并顺序发送, 各自可暂停/取消;
         传完插入对应气泡, 取消/失败插入失败说明。在线发送与离线补发共用。"""
         if not file_units:
             return
         if ip.startswith("web:"):
-            # 手机网页设备: 注册下载链接并推送(手机端点击即下载), 立即记为已发送
             cid = ip[4:]
             for u in file_units:
-                parts = [{"type": "file", "path": si["path"],
-                          "name": si.get("relpath") or os.path.basename(si["path"]),
-                          "size": self._safe_size(si["path"])}
-                         for si in u["send_items"]]
-                self.webbridge.push_desktop_parts(cid, parts, self.hostname)
-                self.signals.sent.emit(
-                    ip, json.dumps([u["record"]], ensure_ascii=False))
+                uid = u.setdefault("transfer_id", str(uuid.uuid4()))
+                self._ensure_send_record(ip, uid, [u["record"]], u["send_items"])
+                status, reason = "offered", ""
+                try:
+                    parts = []
+                    for si in u["send_items"]:
+                        if not Path(si["path"]).is_file():
+                            raise FileNotFoundError(f"文件已移动或删除：{si['path']}")
+                        parts.append({"type": "file", "path": si["path"],
+                                      "name": si.get("relpath") or os.path.basename(si["path"]),
+                                      "size": self._safe_size(si["path"])})
+                    self.webbridge.push_desktop_parts(cid, parts, self.hostname)
+                except Exception as e:
+                    status, reason = "error", str(e)
+                    self._append_log(reason, "error")
+                self._set_message_delivery(ip, uid, status, reason)
+                if queue_id:
+                    self._finish_offline_component(ip, queue_id, uid, status)
             return
         units = []
         for u in file_units:
-            uid = str(uuid.uuid4())
+            uid = u.get("transfer_id") or str(uuid.uuid4())
+            self._ensure_send_record(ip, uid, [u["record"]], u["send_items"])
+            self._set_message_delivery(ip, uid, "sending")
             self._send_units[uid] = {
-                "ctrl": TransferControl(), "ip": ip,
+                "ctrl": TransferControl(), "ip": ip, "queue_id": queue_id,
                 "label": u["label"], "record": u["record"]}
             self.transfer_queue.add_unit(
                 uid, u["label"], direction="send", controllable=True,
                 on_pause=self._on_queue_pause, on_cancel=self._on_queue_cancel)
             units.append((uid, u["send_items"]))
 
+        target_ip = target_ip or self._canonical_ip(ip)
         def worker():
             for uid, sitems in units:
                 meta = self._send_units.get(uid)
@@ -7466,15 +8605,15 @@ class MainWindow(QMainWindow):
                 def on_prog(fn, done, total, speed, _uid=uid):
                     self.signals.send_unit_progress.emit(_uid, done, total, speed)
 
-                status = send_batch(sitems, ip, port, self.hostname, on_log,
-                                    on_progress=on_prog, ctrl=ctrl)
+                status = send_batch(sitems, target_ip, port, self.hostname, on_log,
+                                    on_progress=on_prog, ctrl=ctrl, transfer_id=uid)
                 if status == "ok":
                     self.signals.send_unit_result.emit(uid, "ok", "")
                 elif status == "cancelled":
                     self.signals.send_unit_result.emit(uid, "cancelled", "")
                 else:
                     self.signals.send_unit_result.emit(
-                        uid, "error", last_err["msg"] or "发送失败")
+                        uid, status, last_err["msg"] or "发送失败")
         threading.Thread(target=worker, daemon=True).start()
 
     # ---------- 发送队列回调 ----------
@@ -7500,22 +8639,15 @@ class MainWindow(QMainWindow):
 
     def _on_send_unit_result(self, unit_id, status, reason):
         meta = self._send_units.pop(unit_id, None)
+        self._append_log(f"文件任务结束：{unit_id} 状态={status} 原因={reason}", "send")
         self.transfer_queue.remove_unit(unit_id)
         if meta is None:
             return
         ip, label = meta["ip"], meta["label"]
-        if status == "ok":
-            rec = self._store_msg(ip, "batch",
-                                  json.dumps([meta["record"]], ensure_ascii=False),
-                                  True, self.hostname)
-        else:
-            reason_txt = "已取消" if status == "cancelled" else (reason or "发送失败")
-            rec = self._store_msg(ip, "notice",
-                                  f"📄 {label} 发送失败：{reason_txt}",
-                                  True, self.hostname)
-        if self.current_ip == ip:
-            self._add_bubble_widget(rec)
-            QTimer.singleShot(20, self._scroll_bottom)
+        if meta.get("queue_id"):
+            if not self._finish_offline_component(ip, meta["queue_id"], unit_id, status):
+                status, reason = "unconfirmed", "任务状态未能保存，请检查磁盘后重试处理"
+        self._set_message_delivery(ip, unit_id, status, reason)
         self._peer_list_state = {}
         self._rebuild_peer_list()
 
@@ -7616,7 +8748,7 @@ class MainWindow(QMainWindow):
             return
         ip, label = meta.get("ip"), meta.get("label", "文件")
         rec = self._store_msg(ip, "notice",
-                              f"📥 {label} 接收失败：发送方已取消或连接中断",
+                              f"📥 {label} 接收未完成，已清理本次文件；详情请查看日志",
                               False, self._peer_name(ip))
         if self.current_ip == ip:
             self._add_bubble_widget(rec)
@@ -7642,33 +8774,354 @@ class MainWindow(QMainWindow):
                                      controllable=False)
 
     # ---------- 离线队列 ----------
-    def _flush_offline_queue(self, ip):
-        """对刚上线的 ip 补发离线队列: 文字后台发送, 文件走统一的顶部队列
-        (传完出现气泡, 失败给说明), 与在线发送完全一致。"""
-        queue = self.offline_queue.get(ip, [])
-        if not queue:
-            return
-        if not self._peer_online(ip):
-            return
-        port = self._peer_port(ip)
-        items_to_send = list(queue)
-        self.offline_queue[ip] = []
-        save_offline_queue(self.offline_queue)
+    def _finish_offline_component(self, ip, queue_id, component, status):
+        self._offline_inflight.discard((ip, queue_id, component))
+        before = json.loads(json.dumps(self.offline_queue))
+        entries = self.offline_queue.get(ip, [])
+        for entry in entries:
+            if entry.get("msg_id") != queue_id:
+                continue
+            if component == "text":
+                entry["text_status"] = status
+            else:
+                for unit in entry.get("file_units", []):
+                    if unit.get("transfer_id") == component:
+                        unit["status"] = status
+            delivered = ("ok", "offered", "cancelled")
+            text_done = not entry.get("text_items") or entry.get("text_status") in delivered
+            files_done = all(u.get("status") in delivered for u in entry.get("file_units", []))
+            if text_done and files_done:
+                entries.remove(entry)
+            break
+        if not save_offline_queue(self.offline_queue):
+            self.offline_queue = before
+            if status != "cancelled":
+                for old in self.offline_queue.get(ip, []):
+                    if old.get("msg_id") == queue_id:
+                        if component == "text":
+                            old["text_status"] = "unconfirmed"
+                        else:
+                            for unit in old.get("file_units", []):
+                                if unit.get("transfer_id") == component:
+                                    unit["status"] = "unconfirmed"
+            self._append_log("离线队列状态保存失败，任务仍保留，请检查磁盘空间后重试", "error")
+            return False
         self._peer_list_state = {}
         self._rebuild_peer_list()
+        return True
 
-        for entry in items_to_send:
-            if "file_units" in entry or "text_items" in entry:
-                self._send_text_unit(ip, port, entry.get("text_items") or [])
-                self._start_file_units(ip, port, entry.get("file_units") or [])
+    def _flush_offline_queue(self, ip, only=None):
+        """成功回执后才移除对应内容；失败保留，未确认的内容不盲目重发。"""
+        entries = self.offline_queue.get(ip, [])
+        if not entries or self._waiting_exit:
+            return
+        # 在发送前落盘稳定 ID；重试时接收端可识别已接收的帧。
+        for entry in entries:
+            entry.setdefault("msg_id", str(uuid.uuid4()))
+            if "text_items" not in entry and "file_units" not in entry:
+                entry["text_items"] = entry.get("send_items", [])
+                entry["file_units"] = []
+            for unit in entry.get("file_units", []):
+                unit.setdefault("transfer_id", str(uuid.uuid4()))
+        if not save_offline_queue(self.offline_queue):
+            self._append_log("离线队列无法保存，已暂停补发", "error")
+            return
+        for entry in list(entries):
+            recipient = entry.get("recipient")
+            candidates = [addr for addr, peer in self.online.items()
+                          if peer.get("online") and recipient and self._device_key(addr) == recipient]
+            if not candidates:
+                continue
+            target_ip = sorted(candidates)[0]
+            port = self._peer_port(target_ip)
+            qid = entry["msg_id"]
+            if only and only[0] != qid:
+                continue
+            key = (ip, qid, "text")
+            if ((only is None or only[1] == "text") and entry.get("text_items") and entry.get("text_status") not in ("ok", "offered", "unconfirmed", "cancelled")
+                    and key not in self._offline_inflight):
+                if not self._prepare_source_check(entry["text_items"], lambda i=ip: self._flush_offline_queue(i)):
+                    continue
+                if not self._check_sources(entry["text_items"]):
+                    entry["text_status"] = "error"
+                    self._set_message_delivery(ip, qid, "error", "源文件变化或失效，请点击重试检查")
+                    save_offline_queue(self.offline_queue)
+                else:
+                    entry["text_status"] = "sending"
+                    if not save_offline_queue(self.offline_queue):
+                        entry["text_status"] = "error"
+                        self._append_log("任务状态保存失败，已停止发送", "error")
+                        return
+                    self._offline_inflight.add(key)
+                    self._send_text_unit(ip, port, entry["text_items"], qid, qid, target_ip=target_ip)
+            todo = []
+            for unit in entry.get("file_units", []):
+                if only and only[1] != unit["transfer_id"]:
+                    continue
+                key = (ip, qid, unit["transfer_id"])
+                if unit.get("status") not in ("ok", "offered", "unconfirmed", "cancelled") and key not in self._offline_inflight:
+                    if not self._prepare_source_check(unit["send_items"], lambda i=ip: self._flush_offline_queue(i)):
+                        continue
+                    if not self._check_sources(unit["send_items"]):
+                        unit["status"] = "error"
+                        self._set_message_delivery(ip, unit["transfer_id"], "error", "源文件变化或失效，请点击重试检查")
+                        save_offline_queue(self.offline_queue)
+                        continue
+                    unit["status"] = "sending"
+                    self._offline_inflight.add(key)
+                    todo.append(unit)
+            if todo and not save_offline_queue(self.offline_queue):
+                for unit in todo:
+                    unit["status"] = "error"
+                    self._offline_inflight.discard((ip, qid, unit["transfer_id"]))
+                self._append_log("任务状态保存失败，已停止发送", "error")
+                return
+            self._start_file_units(ip, port, todo, queue_id=qid, target_ip=target_ip)
+
+    def _cache_snapshot(self):
+        self._save_drafts()
+        state = [self._drafts, self.offline_queue, self.staged_receives,
+                 self.input.draft_state(), self.pending, list(self.webbridge.downloads.values())]
+        images, temporary = IMG_DIR, TEMP_RECV_DIR
+        history = self.history
+        def scan():
+            references = collect_paths(state)
+            records = history.referenced_records() if isinstance(history, HistoryStore) else (m for rows in history.values() for m in rows)
+            for record in records:
+                references.update(collect_paths(record))
+            return cache_inventory(images, temporary, references)
+        return scan
+
+    def action_diagnostics(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("日志与存储")
+        dialog.resize(760, 560)
+        dialog.setStyleSheet(_task_dialog_style())
+        layout = QVBoxLayout(dialog)
+        label = QLabel(f"日志目录：{RECV_ROOT / 'log'}\n按天保存，保留最近 7 天；不记录聊天正文和连接口令。")
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        errors = QCheckBox("仅显示错误和警告")
+        layout.addWidget(errors)
+        viewer = QPlainTextEdit()
+        viewer.setReadOnly(True)
+        layout.addWidget(viewer, 1)
+        def refresh():
+            lines = list(self._diagnostics.recent)
+            if errors.isChecked():
+                lines = [line for line in lines if '[ERROR]' in line or '[WARN]' in line]
+            text = '\n'.join(lines)
+            if viewer.toPlainText() != text:
+                viewer.setPlainText(text)
+                viewer.verticalScrollBar().setValue(viewer.verticalScrollBar().maximum())
+        timer = QTimer(dialog)
+        timer.timeout.connect(refresh)
+        timer.start(1000)
+        errors.toggled.connect(refresh)
+        refresh()
+        actions = QHBoxLayout()
+        export = QPushButton("导出最近 7 天日志")
+        actions.addWidget(export)
+        def export_logs():
+            import zipfile
+            target, _ = QFileDialog.getSaveFileName(dialog, "导出日志", "BitFerry-logs.zip", "ZIP (*.zip)")
+            if not target:
+                return
+            self._diagnostics.flush()
+            try:
+                with zipfile.ZipFile(target, 'w', zipfile.ZIP_DEFLATED) as archive:
+                    for file in (RECV_ROOT / 'log').glob('????-??-??.log'):
+                        if not file.is_symlink():
+                            archive.write(file, file.name)
+                self._append_log("用户导出诊断日志", "info")
+            except Exception as exc:
+                QMessageBox.warning(dialog, "导出失败", str(exc))
+        export.clicked.connect(export_logs)
+        scan_button = QPushButton("统计截图与临时文件")
+        clean = QPushButton("清理未使用文件")
+        clean.setEnabled(False)
+        actions.addWidget(scan_button); actions.addWidget(clean)
+        layout.addLayout(actions)
+        size_label = QLabel("仅清理超过 24 小时且没有被记录、草稿、队列引用的缓存。")
+        size_label.setWordWrap(True)
+        layout.addWidget(size_label)
+        def alive():
+            try:
+                return dialog.isVisible()
+            except RuntimeError:
+                return False
+        def scanned(result, error):
+            if not alive():
+                return
+            scan_button.setEnabled(True)
+            if error:
+                size_label.setText("统计失败，请查看日志")
+                return
+            total, candidates = result
+            size_label.setText(f"占用 {human_size(total)} · 可清理 {len(candidates)} 个文件 / {human_size(sum(x[1] for x in candidates))}")
+            clean.setEnabled(bool(candidates))
+        def scan():
+            scan_button.setEnabled(False)
+            size_label.setText("正在后台统计…")
+            self._run_background("cache-scan", self._cache_snapshot(), scanned)
+        scan_button.clicked.connect(scan)
+        def cleanup():
+            if self._transfers_busy():
+                QMessageBox.information(dialog, "暂不能清理", "请等待传输和后台任务完成后再清理。")
+                return
+            if QMessageBox.question(dialog, "清理缓存", "重新检查引用后，删除超过 24 小时的未使用缓存？接收目录中的正式文件不会删除。") != QMessageBox.StandardButton.Yes:
+                return
+            clean.setEnabled(False)
+            snapshot = self._cache_snapshot()
+            def work():
+                total, candidates = snapshot()
+                return delete_cache_candidates(candidates)
+            def done(result, error):
+                if not error:
+                    self._append_log(f"缓存清理完成：{human_size(result)}", "info")
+                if alive():
+                    size_label.setText("清理失败，请查看日志" if error else f"已释放 {human_size(result)}")
+            self._run_background("cache-clean", work, done)
+        clean.clicked.connect(cleanup)
+        try:
+            dialog.exec()
+        finally:
+            timer.stop()
+            dialog.deleteLater()
+
+    def action_send_queue(self):
+        SendQueueDialog(self).exec()
+
+    def _queue_recipient(self, ip, qid):
+        entry = next((e for e in self.offline_queue.get(ip, []) if e.get("msg_id") == qid), {})
+        return entry.get("recipient_name") or entry.get("recipient") or self._peer_name(ip)
+
+    def _queue_rows(self):
+        rows = []
+        for ip, entries in self.offline_queue.items():
+            for entry in entries:
+                qid = entry.get("msg_id", "")
+                identity_blocked = not entry.get("recipient") or (
+                    entry["recipient"] != self._device_key(ip) and not any(
+                        p.get("online") and self._device_key(addr) == entry["recipient"]
+                        for addr, p in self.online.items()))
+                if entry.get("text_items") and entry.get("text_status") not in ("ok", "offered", "cancelled"):
+                    label = " ".join(p.get("text", "[图片]") for p in entry["text_items"])[:80]
+                    status = "sending" if (ip, qid, "text") in self._offline_inflight else entry.get("text_status", "queued")
+                    control = self._text_controls.get(qid)
+                    if control and control.is_cancelled:
+                        status = "cancelling"
+                    rows.append((ip, qid, "text", label, "identity" if identity_blocked and status == "queued" else status))
+                for unit in entry.get("file_units", []):
+                    if unit.get("status") not in ("ok", "offered", "cancelled"):
+                        uid = unit.get("transfer_id", "")
+                        status = "sending" if (ip, qid, uid) in self._offline_inflight else unit.get("status", "queued")
+                        control = self._send_units.get(uid, {}).get("ctrl")
+                        if control and control.is_cancelled:
+                            status = "cancelling"
+                        rows.append((ip, qid, uid, unit["label"], "identity" if identity_blocked and status == "queued" else status))
+        return rows
+
+    def _retry_queue_component(self, ip, qid, component):
+        if (ip, qid, component) in self._offline_inflight:
+            return
+        entry = next((e for e in self.offline_queue.get(ip, []) if e.get("msg_id") == qid), None)
+        if not entry:
+            return
+        if not entry.get("recipient"):
+            answer = QMessageBox.question(self, "确认旧任务的接收设备",
+                f"旧任务没有保存设备身份。是否将它绑定到当前设备 {self._peer_name(ip)} 并重试？")
+            if answer != QMessageBox.StandardButton.Yes:
+                return False
+            entry["recipient"] = self._device_key(ip)
+        part = entry if component == "text" else next((u for u in entry.get("file_units", []) if u.get("transfer_id") == component), None)
+        if part is None:
+            return
+        key = "text_status" if component == "text" else "status"
+        if part.get(key) in ("ok", "offered"):
+            return False
+        if part.get(key) == "unconfirmed":
+            answer = QMessageBox.question(self, "重试未确认的消息", "对方可能已经收到。再次发送可能产生重复内容，是否继续？")
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        items = entry.get("text_items", []) if component == "text" else part.get("send_items", [])
+        if not self._prepare_source_check(items, lambda: self._retry_queue_component(ip, qid, component)):
+            return True
+        if not self._check_sources(items, interactive=True):
+            return False
+        previous = part.get(key, "queued")
+        part[key] = "queued"
+        if not save_offline_queue(self.offline_queue):
+            part[key] = previous
+            self._append_log("无法保存重试任务，请检查磁盘空间", "error")
+            return
+        self._append_log(f"重试任务：{qid}/{component} 接收设备={entry.get('recipient')}", "send")
+        self._set_message_delivery(ip, qid if component == "text" else component, "queued")
+        self._flush_offline_queue(ip, only=(qid, component))
+        return True
+
+    def _retry_message(self, msg_id):
+        for ip, entries in self.offline_queue.items():
+            for entry in entries:
+                qid = entry.get("msg_id")
+                if qid == msg_id and entry.get("text_items"):
+                    self._retry_queue_component(ip, qid, "text")
+                    return
+                for unit in entry.get("file_units", []):
+                    if unit.get("transfer_id") == msg_id:
+                        self._retry_queue_component(ip, qid, msg_id)
+                        return
+        # 已撤销的任务可从历史中的原始发送清单恢复。
+        if isinstance(self.history, HistoryStore):
+            ip, record = self.history.find(msg_id)
+            candidates = [(ip, [record])] if record else []
+        else:
+            candidates = self.history.items()
+        for ip, records in candidates:
+            record = next((m for m in records if m.get("msg_id") == msg_id), None)
+            if not record or record.get("delivery") not in ("error", "cancelled", "unconfirmed"):
+                continue
+            items = record.get("retry_items")
+            if not items:
+                QMessageBox.information(self, "无法自动重试", "这条旧记录没有保存发送清单，请重新添加附件。")
+                return
+            parts = record.get("retry_parts", [])
+            entry = {"recipient": record.get("recipient"), "msg_id": msg_id, "ts": now_hm(), "text_items": [], "file_units": []}
+            if parts and parts[0].get("type") == "file":
+                entry["file_units"] = [{"transfer_id": msg_id, "send_items": items,
+                                         "record": parts[0], "label": parts[0]["name"],
+                                         "status": record.get("delivery")}]
+                component = msg_id
             else:
-                # 兼容旧格式(整批一次性发送)
-                send_items = entry.get("send_items", [])
+                entry.update(text_items=items, text_record=parts, text_status=record.get("delivery"))
+                component = "text"
+            self.offline_queue.setdefault(ip, []).append(entry)
+            if not self._retry_queue_component(ip, msg_id, component):
+                self.offline_queue[ip].remove(entry)
+            return
 
-                def do(_items=send_items):
-                    send_batch(_items, ip, port, self.hostname,
-                               lambda m, k="send": self.signals.log.emit(m, k))
-                threading.Thread(target=do, daemon=True).start()
+    def _cancel_queue_component(self, ip, qid, component):
+        mid = qid if component == "text" else component
+        if (ip, qid, component) in self._offline_inflight:
+            ctrl = self._text_controls.get(mid) if component == "text" else self._send_units.get(mid, {}).get("ctrl")
+            if ctrl:
+                ctrl.cancel()
+                self._set_message_delivery(ip, mid, "cancelling")
+            return
+        if self._finish_offline_component(ip, qid, component, "cancelled"):
+            self._append_log(f"用户撤销任务：{qid}/{component}", "send")
+            self._set_message_delivery(ip, mid, "cancelled")
+        else:
+            QMessageBox.warning(self, "撤销未完成", "无法保存撤销结果，任务仍在队列中。请检查磁盘空间和权限后重试。")
+
+    def _save_staged_receives(self):
+        if not _write_json_atomic(STAGED_FILE, self.staged_receives):
+            self._append_log("待接收清单保存失败，请检查磁盘空间；暂存文件仍然保留", "error")
+            return False
+        return True
+
+    def _staged_keys(self, ip):
+        return [key for key in self.staged_receives if self._device_key(key) == self._device_key(ip)]
 
     # ---------- 待确认接收 ----------
     def _update_staged_banner(self):
@@ -7676,7 +9129,7 @@ class MainWindow(QMainWindow):
         if not ip:
             self.recv_pending_banner.hide()
             return
-        staged = self.staged_receives.get(ip, [])
+        staged = [entry for key in self._staged_keys(ip) for entry in self.staged_receives[key]]
         if not staged:
             self.recv_pending_banner.hide()
             return
@@ -7693,68 +9146,103 @@ class MainWindow(QMainWindow):
             parts_desc.append(f"{n_images} 张图片")
         sender = staged[0]["name"] if staged else "对方"
         desc = "、".join(parts_desc) or "内容"
-        self.recv_pending_lbl.setText(f"📥 {sender} 发来 {desc}，等待接收确认")
+        processing = sum(p.get("path") in self._staged_processing for entry in staged for p in entry["parts"])
+        state = f"正在后台处理 {processing} 项…" if processing else "等待接收确认"
+        self.recv_pending_lbl.setText(f"📥 {sender} 发来 {desc}，{state}")
         self.recv_pending_banner.show()
 
     def _staged_files(self, ip):
         """当前 ip 所有待确认的文件部件(扁平列表)。"""
         out = []
-        for item in self.staged_receives.get(ip, []):
+        for item in [entry for key in self._staged_keys(ip) for entry in self.staged_receives[key]]:
             for part in item["parts"]:
                 if part.get("type") == "file" and part.get("staged"):
                     out.append((item["name"], part))
         return out
 
     def _resolve_staged(self, ip, accept_paths):
-        """接收 accept_paths 里的文件(移到最终目录并入聊天), 其余删除/拒绝。"""
-        staged = self.staged_receives.pop(ip, [])
-        n_ok = n_no = 0
-        for item in staged:
-            for part in item["parts"]:
-                if not (part.get("type") == "file" and part.get("staged")):
-                    continue
-                if part.get("path") in accept_paths:
-                    src = Path(part["path"])
-                    dest_dir = Path(part.get("final_dir", str(globals()["RECV_ROOT"])))
-                    dest_dir.mkdir(parents=True, exist_ok=True)
-                    dest = dest_dir / src.name
-                    b, e = os.path.splitext(src.name)
-                    i = 1
-                    while dest.exists():
-                        dest = dest_dir / f"{b}_{i}{e}"
-                        i += 1
-                    fp = dict(part)
-                    try:
-                        import shutil
-                        shutil.move(str(src), str(dest))
-                        fp["path"] = str(dest)
-                        fp["staged"] = False
-                    except Exception:
-                        pass
-                    rec = self._store_msg(ip, "batch",
-                                          json.dumps([fp], ensure_ascii=False),
-                                          False, item["name"])
-                    if self.current_ip == ip:
-                        self._add_bubble_widget(rec)
-                    n_ok += 1
-                else:
-                    try:
-                        p = Path(part["path"])
-                        if p.is_dir():
-                            import shutil
-                            shutil.rmtree(p, ignore_errors=True)
-                        else:
-                            p.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-                    n_no += 1
-        if self.current_ip == ip and n_ok:
-            QTimer.singleShot(20, self._scroll_bottom)
+        """在后台处理磁盘操作，完成后由主线程更新清单和界面。"""
+        jobs = []
+        for key in self._staged_keys(ip):
+            for entry in self.staged_receives[key]:
+                for part in entry["parts"]:
+                    path = part.get("path", "")
+                    if not _safe_staged_path(path):
+                        self._append_log("已阻止对异常暂存路径的操作", "error")
+                        continue
+                    if path in self._staged_processing:
+                        continue
+                    self._staged_processing.add(path)
+                    jobs.append((key, entry["name"], dict(part), path in accept_paths))
+        if not jobs:
+            return
         self._update_staged_banner()
-        if n_ok or n_no:
-            self._append_log(
-                f"来自 {ip}: 接收 {n_ok} 个文件" + (f", 拒绝 {n_no} 个" if n_no else ""),
-                "recv")
+        self._append_log(f"正在后台处理 {len(jobs)} 个待接收项…", "recv")
+        def worker():
+            import shutil
+            results = []
+            for key, name, part, accept in jobs:
+                src = Path(part.get("path", ""))
+                dest = None
+                error = ""
+                try:
+                    if not _safe_staged_path(src):
+                        raise ValueError("异常暂存路径，已停止处理")
+                    if accept:
+                        folder = Path(part.get("final_dir") or RECV_ROOT)
+                        dest = _reserve_recv_path(folder, src.name, folder, directory=src.is_dir())
+                        if src.is_dir():
+                            # Windows 不允许把目录 rename 到已存在的空目录。
+                            # 保留独占目录，后台复制完成后再清理源文件。
+                            shutil.copytree(src, dest, dirs_exist_ok=True)
+                            try:
+                                shutil.rmtree(src)
+                            except OSError as exc:
+                                self.signals.log.emit(f"已接收，暂存副本清理失败：{exc}", "error")
+                        else:
+                            shutil.move(str(src), str(dest))
+                    elif src.is_dir():
+                        shutil.rmtree(src)
+                    else:
+                        src.unlink(missing_ok=True)
+                except Exception as exc:
+                    error = str(exc)
+                    if dest and src.exists():
+                        if dest.is_dir():
+                            shutil.rmtree(dest, ignore_errors=True)
+                        else:
+                            try:
+                                dest.unlink(missing_ok=True)
+                            except OSError:
+                                pass
+                results.append((key, name, part, accept, str(dest) if dest else "", error))
+            self.signals.staged_resolved.emit(ip, results)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_staged_resolved(self, ip, results):
+        n_ok = n_no = 0
+        for key, name, part, accept, dest, error in results:
+            self._staged_processing.discard(part["path"])
+            if error:
+                self._append_log(f"处理 {Path(part['path']).name} 失败，已保留待接收项：{error}", "error")
+                continue
+            for entry in list(self.staged_receives.get(key, [])):
+                entry["parts"] = [p for p in entry["parts"] if p.get("path") != part["path"]]
+                if not entry["parts"]:
+                    self.staged_receives[key].remove(entry)
+            if not self.staged_receives.get(key):
+                self.staged_receives.pop(key, None)
+            if accept:
+                saved = dict(part, path=dest, staged=False)
+                rec = self._store_msg(key, "batch", json.dumps([saved], ensure_ascii=False), False, name)
+                if self.current_ip == ip:
+                    self._add_bubble_widget(rec)
+                n_ok += 1
+            else:
+                n_no += 1
+        self._save_staged_receives()
+        self._update_staged_banner()
+        self._append_log(f"接收 {n_ok} 项，拒绝 {n_no} 项", "recv")
 
     def _select_staged(self):
         ip = self.current_ip
@@ -7929,8 +9417,19 @@ class MainWindow(QMainWindow):
         if not ip:
             QMessageBox.information(self, "聊天记录", "请先在左侧选择一台设备。")
             return
-        dlg = HistoryDialog(self, self._peer_name(ip), self.history.get(ip, []))
-        dlg.exec()
+        if isinstance(self.history, HistoryStore):
+            ips = [key for key in self.history if self._device_key(key) == self._device_key(ip)]
+            dlg = HistoryDialog(self, self._peer_name(ip), [], self._retry_message,
+                                store=self.history, ips=ips)
+        else:
+            messages = [m for key, records in self.history.items()
+                        if self._device_key(key) == self._device_key(ip) for m in records]
+            messages.sort(key=lambda m: (m.get("day", ""), m.get("ts", ""), m.get("seq", 0)))
+            dlg = HistoryDialog(self, self._peer_name(ip), messages, self._retry_message)
+        try:
+            dlg.exec()
+        finally:
+            dlg.deleteLater()
 
     def action_open_recv(self):
         system = platform.system()
@@ -7965,6 +9464,8 @@ class MainWindow(QMainWindow):
                                 f"该位置不可写入，请换一个：\n{e}")
             return
         RECV_ROOT = new_root
+        self._diagnostics.root = new_root
+        self._diagnostics.record("info", f"接收目录已更改：{new_root}")
         save_recv_root(new_root)
         self.recv_path_lbl.setText(str(new_root))
         self.recv_path_lbl.setToolTip(str(new_root))
@@ -7979,6 +9480,8 @@ class MainWindow(QMainWindow):
     def _append_log(self, msg, kind):
         # 没有独立日志面板了, 重要信息进聊天状态栏/控制台
         print(f"[{kind}] {msg}")
+        if hasattr(self, "_diagnostics"):
+            self._diagnostics.record(kind, msg)
         if kind == "error" and self.current_ip:
             self.chat_status.setText(msg)
             self.chat_status.setStyleSheet(f"color:{_theme_color('danger')};")
@@ -7995,6 +9498,30 @@ class MainWindow(QMainWindow):
                     self._rebuild_peer_list()
                     self._update_title_unread()
         super().changeEvent(event)
+
+    def _transfers_busy(self):
+        return bool(self._folder_scans or self._staged_processing or self._send_units or self._text_controls
+                    or self._offline_inflight or self._recv_meta or self._background_jobs
+                    or getattr(self.receiver, "active_connections", 0)
+                    or getattr(self.webbridge, "active_requests", 0))
+
+    def _wait_for_exit(self):
+        if not self._waiting_exit:
+            return
+        if self._transfers_busy():
+            QTimer.singleShot(300, self._wait_for_exit)
+            return
+        self._force_quit = True
+        if self.close():
+            QApplication.quit()
+
+    def _cancel_wait_exit(self):
+        self._waiting_exit = False
+        self.btn_cancel_exit.hide()
+        self.receiver.start()
+        if getattr(self, "_web_was_running", False):
+            self.webbridge.start()
+        self._append_log("已取消等待退出", "info")
 
     def closeEvent(self, event):
         # 记住窗口大小/位置(无论最小化到托盘还是真正退出都记一次)
@@ -8019,7 +9546,29 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
             return
+        if self._transfers_busy():
+            event.ignore()
+            if self._waiting_exit:
+                return
+            answer = QMessageBox.question(self, "仍有传输或后台任务", "是否在所有传输和后台任务完成后自动退出？暂停的发送任务需要先恢复或撤销。")
+            if answer == QMessageBox.StandardButton.Yes:
+                self._waiting_exit = True
+                self.receiver.stop()
+                self._web_was_running = self.webbridge.running()
+                self.webbridge.stop()
+                self.btn_cancel_exit.show()
+                self._append_log("用户选择传输完成后退出，暂停新接收和新发送", "info")
+                QTimer.singleShot(300, self._wait_for_exit)
+            return
         # 真正退出: 清理资源
+        self._draft_timer.stop()
+        self._save_drafts()
+        self._save_staged_receives()
+        self._draft_writer.flush()
+        self._append_log("应用正常退出", "info")
+        self._diagnostics.flush()
+        for _, cancel in self._folder_scans.values():
+            cancel.set()
         self.discovery.stop()
         self.receiver.stop()
         self._save_history()
@@ -8049,6 +9598,9 @@ def _parse_version(s: str):
             else:
                 break
         parts.append(int(num) if num else 0)
+    # 1.2 和 1.2.0 表示同一版本，避免两段版本号误判更新。
+    while len(parts) > 1 and parts[-1] == 0:
+        parts.pop()
     return tuple(parts) if parts else (0,)
 
 
@@ -8181,20 +9733,34 @@ def _current_app_bundle():
     return None
 
 
+def _extract_macos_update(zip_path, workdir):
+    """ditto 保留 .app 的执行权限和框架符号链接，zipfile.extractall 不保留。"""
+    import zipfile
+    with zipfile.ZipFile(zip_path) as archive:
+        for entry in archive.infolist():
+            path = Path(entry.filename)
+            if path.is_absolute() or ".." in path.parts:
+                raise ValueError("更新包包含越界路径")
+    subprocess.run(["/usr/bin/ditto", "-x", "-k", str(zip_path), str(workdir)],
+                   check=True, capture_output=True)
+
+
 def apply_update_macos(zip_path):
     """解压新包并安排"退出后替换+重启"，调用后应立即退出当前进程。"""
-    import zipfile
+    import shlex
     app = _current_app_bundle()
     if app is None:
         raise RuntimeError("未找到当前 .app，可能不是打包运行。")
     workdir = Path(tempfile.mkdtemp(prefix="bitferry_update_"))
-    with zipfile.ZipFile(zip_path) as z:
-        z.extractall(workdir)
+    _extract_macos_update(zip_path, workdir)
     new_app = next((c for c in workdir.iterdir() if c.suffix == ".app"), None)
     if new_app is None:
         new_app = next(iter(workdir.rglob("*.app")), None)
     if new_app is None:
         raise RuntimeError("更新包内未找到 .app")
+    executable = new_app / "Contents" / "MacOS" / "BitFerry"
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        raise RuntimeError("更新包主程序缺失或没有执行权限，已保留当前版本。")
 
     pid = os.getpid()
     backup = app.with_name(app.name + ".bak")
@@ -8204,20 +9770,25 @@ def apply_update_macos(zip_path):
     script.write_text(f'''#!/bin/bash
 while kill -0 {pid} 2>/dev/null; do sleep 0.3; done
 sleep 0.5
-TARGET="{app}"
-NEW="{new_app}"
-BACKUP="{backup}"
+TARGET={shlex.quote(str(app))}
+NEW={shlex.quote(str(new_app))}
+BACKUP={shlex.quote(str(backup))}
 rm -rf "$BACKUP" 2>/dev/null || true
-mv "$TARGET" "$BACKUP" 2>/dev/null || true
+mv "$TARGET" "$BACKUP" || exit 1
 if mv "$NEW" "$TARGET"; then
     xattr -dr com.apple.quarantine "$TARGET" 2>/dev/null || true
-    rm -rf "$BACKUP" 2>/dev/null || true
-    open "$TARGET"
+    if open "$TARGET"; then
+        rm -rf "$BACKUP" 2>/dev/null || true
+    else
+        rm -rf "$TARGET"
+        mv "$BACKUP" "$TARGET"
+        open "$TARGET"
+    fi
 else
     mv "$BACKUP" "$TARGET" 2>/dev/null || true
     open "$TARGET"
 fi
-rm -rf "{workdir}" 2>/dev/null || true
+rm -rf {shlex.quote(str(workdir))} 2>/dev/null || true
 ''', encoding="utf-8")
     script.chmod(0o755)
     subprocess.Popen(["/bin/bash", str(script)],
@@ -8300,51 +9871,155 @@ def apply_update_windows(new_exe_path):
 _SINGLE_INSTANCE_KEY = "BitFerry-single-instance"
 
 
+def _windows_mutex_api():
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel.CreateMutexW.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    return kernel, ctypes.get_last_error
+
+
+class _SingleInstanceGuard:
+    """锁决定是否能启动；本地管道仅负责唤起窗口，不能替代互斥锁。"""
+    def __init__(self):
+        self._handle = None
+        self._kernel = None
+        self._lock_file = None
+
+    def acquire(self):
+        if platform.system() == "Windows":
+            kernel, get_error = _windows_mutex_api()
+            # 接收端口是全机资源，同一台机器的多个登录会话也不能抢占。
+            handle = kernel.CreateMutexW(None, False, "Global\\BitFerry-single-instance")
+            error = get_error()
+            if not handle:
+                raise RuntimeError(f"无法建立单实例保护（Windows 错误 {error}）。"
+                                   "程序可能已在其他账户或不同权限下运行。")
+            if error == 183:  # ERROR_ALREADY_EXISTS；不能把打开已有句柄当成获锁
+                kernel.CloseHandle(handle)
+                return False
+            self._kernel, self._handle = kernel, handle
+            return True
+        APP_DATA.mkdir(parents=True, exist_ok=True)
+        lock = QLockFile(str(APP_DATA / "instance.lock"))
+        lock.setStaleLockTime(0)  # 长期持有，不按文件年龄抢走活跃实例的锁
+        if not lock.tryLock(0):
+            if lock.error() != QLockFile.LockError.LockFailedError:
+                raise RuntimeError("无法建立单实例保护，请检查应用数据目录的权限。")
+            return False
+        self._lock_file = lock
+        return True
+
+    def release(self):
+        if self._handle is not None:
+            self._kernel.CloseHandle(self._handle)
+            self._handle = None
+        if self._lock_file is not None:
+            self._lock_file.unlock()
+            self._lock_file = None
+
+
+def _activate_existing_instance(timeout_ms=4000):
+    """返回 (已连接, 已响应)。等待首次启动完成，但绝不另开一套服务。"""
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        probe = QLocalSocket()
+        try:
+            probe.connectToServer(_SINGLE_INSTANCE_KEY)
+            remaining = max(1, int((deadline - time.monotonic()) * 1000))
+            if probe.waitForConnected(min(200, remaining)):
+                probe.write(b"raise")
+                probe.flush()
+                remaining = max(1, int((deadline - time.monotonic()) * 1000))
+                probe.waitForBytesWritten(min(200, remaining))
+                reply = bytes(probe.readAll())
+                while b"raised" not in reply and time.monotonic() < deadline:
+                    remaining = max(1, int((deadline - time.monotonic()) * 1000))
+                    if not probe.waitForReadyRead(remaining):
+                        break
+                    reply += bytes(probe.readAll())
+                return True, b"raised" in reply
+        finally:
+            probe.abort()
+        time.sleep(0.05)
+    return False, False
+
+
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("BitFerry")
-
-    # ---- 单实例保护 ----
-    # 先尝试连上已运行实例的本地服务：连得上说明已有一个 BitFerry 在跑，
-    # 就请它把窗口带到前台，然后本进程直接退出(不再抢占 50808/50809/50810 端口，
-    # 避免第二个实例静默地收不到文件)。
-    probe = QLocalSocket()
-    probe.connectToServer(_SINGLE_INSTANCE_KEY)
-    if probe.waitForConnected(300):
-        try:
-            probe.write(b"raise")
-            probe.flush()
-            probe.waitForBytesWritten(300)
-        finally:
-            probe.disconnectFromServer()
-        QMessageBox.information(None, "BitFerry",
-                               "BitFerry 已在运行。\n已为你唤出正在运行的窗口。")
+    guard = _SingleInstanceGuard()
+    try:
+        acquired = guard.acquire()
+    except Exception as e:
+        QMessageBox.warning(None, "BitFerry 无法启动", str(e))
         return
-    probe.abort()
+    if not acquired:
+        _, activated = _activate_existing_instance()
+        if not activated:
+            QMessageBox.information(None, "BitFerry 已在运行",
+                                    "已有实例正在启动、暂未响应，或运行于其他账户。\n"
+                                    "请稍后重试或检查任务栏、系统托盘；不会启动第二个实例。")
+        return
 
-    # 没连上：可能确实没在跑，也可能上次崩溃残留了 socket 文件，先清理再监听。
-    QLocalServer.removeServer(_SINGLE_INSTANCE_KEY)
-    server = QLocalServer()
-    server.listen(_SINGLE_INSTANCE_KEY)
+    try:
+        # 兼容升级前已经运行的旧版本：它还没有互斥锁，但可能拥有唤起管道。
+        connected, activated = _activate_existing_instance(timeout_ms=200)
+        if connected:
+            if not activated:
+                QMessageBox.information(None, "BitFerry 已在运行", "已请求现有实例显示窗口，请检查任务栏或系统托盘。")
+            return
+        # 只有持锁实例可以处理崩溃残留的本地服务。
+        QLocalServer.removeServer(_SINGLE_INSTANCE_KEY)
+        server = QLocalServer()
+        if not server.listen(_SINGLE_INSTANCE_KEY):
+            QMessageBox.warning(None, "BitFerry 无法启动",
+                                f"无法创建窗口唤起服务：{server.errorString()}")
+            return
 
-    _try_open_win_firewall()
-    f = QFont()
-    f.setFamily("PingFang SC" if platform.system() == "Darwin" else "Microsoft YaHei UI")
-    f.setPointSize(13 if platform.system() == "Darwin" else 10)
-    app.setFont(f)
-    win = MainWindow()
+        _try_open_win_firewall()
+        f = QFont()
+        f.setFamily("PingFang SC" if platform.system() == "Darwin" else "Microsoft YaHei UI")
+        f.setPointSize(13 if platform.system() == "Darwin" else 10)
+        app.setFont(f)
+        win = MainWindow()
+        import traceback
+        previous_hook = sys.excepthook
+        def report_exception(kind, value, tb):
+            win._diagnostics.record("error", "".join(traceback.format_exception(kind, value, tb)))
+            previous_hook(kind, value, tb)
+        sys.excepthook = report_exception
+        if hasattr(threading, "excepthook"):
+            threading.excepthook = lambda args: report_exception(args.exc_type, args.exc_value, args.exc_traceback)
 
-    def _on_second_instance():
-        conn = server.nextPendingConnection()
-        if conn is not None:
-            conn.readAll()   # 读掉 "raise"，无需解析
-            win._bring_to_front()
-            conn.disconnectFromServer()
-    server.newConnection.connect(_on_second_instance)
-    win._instance_server = server   # 持引用，防止被 GC 关掉监听
-
-    win.show()
-    sys.exit(app.exec())
+        def _on_second_instance():
+            while server.hasPendingConnections():
+                conn = server.nextPendingConnection()
+                if conn is not None:
+                    win._bring_to_front()
+                    win._append_log("重复启动：已唤起现有窗口", "info")
+                    conn.write(b"raised")
+                    conn.flush()
+                    conn.disconnected.connect(conn.deleteLater)
+                    conn.disconnectFromServer()
+        server.newConnection.connect(_on_second_instance)
+        win._instance_server = server
+        # 初始化窗口期间已经到达的连接，也必须被处理。
+        QTimer.singleShot(0, _on_second_instance)
+        win.show()
+        app.exec()
+    finally:
+        # 关监听后再释放互斥锁；不在 aboutToQuit 时提前允许第二个实例抢入。
+        if "win" in locals():
+            win.discovery.stop()
+            win.receiver.stop()
+            win.webbridge.stop()
+        if "server" in locals():
+            server.close()
+        guard.release()
 
 
 if __name__ == "__main__":
