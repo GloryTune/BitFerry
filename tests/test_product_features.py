@@ -737,20 +737,30 @@ class ProductTests(unittest.TestCase):
         self.assertAlmostEqual(canvas._annotations[0].font.pointSizeF() * canvas._scale, 36, places=4)
         self.assertEqual(app._text_size_setting(), 36)
 
-    def test_screenshot_toolbar_font_control_changes_annotation(self):
+    def test_screenshot_size_buttons_switch_between_width_and_text_presets(self):
         overlay = app.ScreenshotOverlay(app.QPixmap(1000, 800), app.QRect(0, 0, 1000, 800), Mock())
         self.addCleanup(overlay.deleteLater)
         overlay._sel = app.QRect(10, 10, 500, 400)
         overlay._build_toolbar()
-        overlay._font_size_spin.setValue(28)
+        self.assertFalse(hasattr(overlay, '_font_size_spin'))
+        overlay._select_tool('rect')
+        self.assertEqual([b.text() for b in overlay._size_btns], ['细', '中', '粗'])
+        overlay._size_btns[2].click()
+        self.assertEqual(overlay._width, 7)
+        overlay._select_tool('text')
+        self.assertEqual([b.text() for b in overlay._size_btns], ['小', '中', '大'])
+        overlay._size_btns[2].click()
+        self.assertEqual(overlay._text_size, 28)
+        self.assertEqual(overlay._width, 7)
+        self.assertTrue(overlay._size_btns[2].isChecked())
         overlay._begin_text(app.QPoint(50, 50))
         edit = overlay._text_edit
         overlay._commit_text('hello', edit, app.QPoint(50, 50), app.QColor('red'), edit.font())
         self.assertEqual(overlay._annotations[0].font.pointSize(), 28)
-        overlay._font_size_spin.setValue(48)
-        self.assertEqual(overlay._annotations[0].font.pointSize(), 48)
+        overlay._size_btns[0].click()
+        self.assertEqual(overlay._annotations[0].font.pointSize(), 14)
 
-    def test_selected_text_syncs_font_control_without_changing_annotation(self):
+    def test_selected_text_syncs_size_buttons_without_changing_annotation(self):
         dialog = app.ImageEditorDialog(self.w, str(self.make_image()))
         self.addCleanup(dialog.deleteLater)
         canvas = dialog.canvas
@@ -760,7 +770,8 @@ class ProductTests(unittest.TestCase):
         canvas._annotations = [ann]
         canvas._selected = 0
         app._sync_annotation_font(canvas)
-        self.assertEqual(canvas._font_size_spin.value(), 32)
+        self.assertEqual([b.text() for b in canvas._size_btns], ['小', '中', '大'])
+        self.assertEqual([b.isChecked() for b in canvas._size_btns], [False, False, True])
         self.assertAlmostEqual(ann.font.pointSizeF() * canvas._scale, 32)
 
 

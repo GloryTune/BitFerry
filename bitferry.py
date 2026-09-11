@@ -37,7 +37,7 @@ from datetime import datetime
 
 from PyQt6.QtCore import (
     Qt, QObject, pyqtSignal, QSize, QBuffer, QByteArray, QTimer, QUrl,
-    QRectF, QRect, QPoint, QPointF, QAbstractNativeEventFilter, QLockFile,
+    QRectF, QRect, QPoint, QPointF, QAbstractNativeEventFilter, QLockFile, QLocale,
 )
 from PyQt6.QtGui import (
     QFont, QPixmap, QImage, QKeySequence, QShortcut, QTextCursor, QGuiApplication,
@@ -50,7 +50,7 @@ from PyQt6.QtWidgets import (
     QMessageBox, QPlainTextEdit, QSizePolicy, QScrollArea, QTextEdit,
     QStackedWidget, QSpacerItem, QSystemTrayIcon, QMenu, QDialog, QLineEdit,
     QProgressBar, QRadioButton, QButtonGroup, QToolButton, QCheckBox,
-    QSpinBox, QTableWidget, QTableWidgetItem, QHeaderView, QComboBox,
+    QTableWidget, QTableWidgetItem, QHeaderView, QComboBox,
 )
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 
@@ -1542,36 +1542,56 @@ def _change_annotation_size(owner, size):
     owner.update()
 
 
-def _font_size_control(lay, owner):
-    label = QLabel("字号")
-    label.setStyleSheet("color:#E6E8EC;")
-    lay.addWidget(label)
-    spin = QSpinBox()
-    spin.setRange(8, 96)
-    spin.setValue(owner._text_size)
-    spin.setSuffix(" pt")
-    spin.setKeyboardTracking(False)
-    spin.setFixedWidth(82)
-    spin.setToolTip("设置新文字字号；选中文字后也可以调整大小")
-    spin.setStyleSheet("QSpinBox { color:#E6E8EC; background:#343945; padding:3px; }")
-    spin.valueChanged.connect(lambda value: _change_annotation_size(owner, value))
-    lay.addWidget(spin)
-    owner._font_size_spin = spin
-    return spin
+def _size_mode_is_text(owner):
+    """文字工具或选中文字标注时，大小按钮调字号；否则调线宽（同微信截图）。"""
+    index = owner._selected
+    if index is not None and 0 <= index < len(owner._annotations):
+        return owner._annotations[index].kind == "text"
+    return owner._tool == "text"
+
+
+def _size_buttons(lay, bar, owner, on_click):
+    """细/中/粗 与 小/中/大 共用一组按钮，文案和选中态随模式刷新。"""
+    owner._size_btns = []
+    for i in range(len(ScreenshotOverlay.WIDTHS)):
+        b = QToolButton(bar)
+        b.setCheckable(True)
+        b.setCursor(Qt.CursorShape.PointingHandCursor)
+        b.clicked.connect(lambda _=False, idx=i: on_click(idx))
+        lay.addWidget(b)
+        owner._size_btns.append(b)
+    _refresh_size_buttons(owner)
+
+
+def _refresh_size_buttons(owner):
+    buttons = getattr(owner, "_size_btns", None)
+    if not buttons:
+        return
+    text = _size_mode_is_text(owner)
+    sizes = ScreenshotOverlay.TEXT_SIZES
+    current = min((s for _, s in sizes), key=lambda s: abs(s - owner._text_size))
+    for b, (w_label, w), (t_label, t) in zip(buttons, ScreenshotOverlay.WIDTHS, sizes):
+        b.setText(t_label if text else w_label)
+        b.setToolTip("文字大小" if text else "线条粗细")
+        b.setChecked(t == current if text else w == owner._width)
+
+
+def _select_size(owner, index, select_width):
+    if _size_mode_is_text(owner):
+        _change_annotation_size(owner, ScreenshotOverlay.TEXT_SIZES[index][1])
+    else:
+        select_width(ScreenshotOverlay.WIDTHS[index][1])
+    _refresh_size_buttons(owner)
 
 
 def _sync_annotation_font(owner):
     index = owner._selected
-    spin = getattr(owner, "_font_size_spin", None)
-    if spin is None or index is None:
+    if index is None:
         return
     ann = owner._annotations[index]
     if ann.kind == "text":
-        size = round(ann.font.pointSizeF() * getattr(owner, "_scale", 1.0))
-        blocked = spin.blockSignals(True)
-        spin.setValue(size)
-        spin.blockSignals(blocked)
-        owner._text_size = spin.value()
+        owner._text_size = round(ann.font.pointSizeF() * getattr(owner, "_scale", 1.0))
+    _refresh_size_buttons(owner)
 
 
 def _save_editable_layers(path, base, annotations, offset=None, scale=1.0):
@@ -1663,6 +1683,7 @@ class ScreenshotOverlay(QWidget):
 
     COLORS = ["#FB3B4E", "#FFC400", "#2ECC71", "#3B82F6", "#FFFFFF", "#000000"]
     WIDTHS = [("细", 2), ("中", 4), ("粗", 7)]
+    TEXT_SIZES = [("小", 14), ("中", 20), ("大", 28)]
 
     def __init__(self, full_pixmap, vrect, on_done, win_rects=None):
         super().__init__()
@@ -1744,6 +1765,8 @@ class ScreenshotOverlay(QWidget):
         return QPoint(x, y)
 
     def paintEvent(self, e):
+        # 选中/取消选中标注的入口很多，重绘时顺带同步大小按钮（文案未变时不触发重绘）。
+        _refresh_size_buttons(self)
         p = QPainter(self)
         p.drawPixmap(0, 0, self._full)
         p.fillRect(self.rect(), QColor(0, 0, 0, 120))
@@ -2122,7 +2145,6 @@ class ScreenshotOverlay(QWidget):
         add_tool("arrow", "箭头")
         add_tool("pen", "画笔")
         add_tool("text", "文字")
-        _font_size_control(lay, self)
 
         self._add_sep(lay)
         # 颜色
@@ -2145,18 +2167,8 @@ class ScreenshotOverlay(QWidget):
             self._color_btns[0][1].setChecked(True)
 
         self._add_sep(lay)
-        # 线宽
-        self._width_btns = []
-        for label, w in self.WIDTHS:
-            b = QToolButton(bar)
-            b.setText(label)
-            b.setCheckable(True)
-            b.setCursor(Qt.CursorShape.PointingHandCursor)
-            b.clicked.connect(lambda _=False, ww=w: self._select_width(ww))
-            if w == self._width:
-                b.setChecked(True)
-            lay.addWidget(b)
-            self._width_btns.append((w, b))
+        # 线宽 / 文字大小（随工具切换）
+        _size_buttons(lay, bar, self, lambda i: _select_size(self, i, self._select_width))
 
         self._add_sep(lay)
         b_undo = QToolButton(bar); b_undo.setText("↶"); b_undo.setToolTip("撤销 (Ctrl+Z)")
@@ -2204,6 +2216,7 @@ class ScreenshotOverlay(QWidget):
         for k, b in self._tool_btns.items():
             b.setChecked(k == key)
         self.setCursor(Qt.CursorShape.CrossCursor if key else Qt.CursorShape.ArrowCursor)
+        _refresh_size_buttons(self)
         self.update()
 
     def _select_color(self, c):
@@ -2217,11 +2230,10 @@ class ScreenshotOverlay(QWidget):
 
     def _select_width(self, w):
         self._width = w
-        for ww, b in self._width_btns:
-            b.setChecked(ww == w)
         if self._selected is not None and 0 <= self._selected < len(self._annotations):
             self._annotations[self._selected].width = w
             self.update()
+        _refresh_size_buttons(self)
 
     # ---------- 完成/取消 ----------
     def _confirm(self):
@@ -2332,6 +2344,7 @@ class _EditorCanvas(QWidget):
 
     # ---------- 绘制 ----------
     def paintEvent(self, e):
+        _refresh_size_buttons(self)
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.save()
@@ -2788,7 +2801,6 @@ class ImageEditorDialog(QDialog):
         add_tool("arrow", "箭头")
         add_tool("pen", "画笔")
         add_tool("text", "文字")
-        _font_size_control(lay, self.canvas)
 
         self._add_sep(lay)
         self._color_btns = []
@@ -2806,17 +2818,7 @@ class ImageEditorDialog(QDialog):
         self._color_btns[0][1].setChecked(True)
 
         self._add_sep(lay)
-        self._width_btns = []
-        for label, w in ScreenshotOverlay.WIDTHS:
-            b = QToolButton(bar)
-            b.setText(label)
-            b.setCheckable(True)
-            b.setCursor(Qt.CursorShape.PointingHandCursor)
-            b.clicked.connect(lambda _=False, ww=w: self._select_width(ww))
-            if w == 4:
-                b.setChecked(True)
-            lay.addWidget(b)
-            self._width_btns.append((w, b))
+        _size_buttons(lay, bar, self.canvas, lambda i: _select_size(self.canvas, i, self._select_width))
 
         lay.addStretch()
         lay = QHBoxLayout()
@@ -2863,6 +2865,7 @@ class ImageEditorDialog(QDialog):
             self.canvas.cancel_crop()
         for k, b in self._tool_btns.items():
             b.setChecked(k == key)
+        _refresh_size_buttons(self.canvas)
 
     def _select_color(self, c):
         self.canvas.set_color(c)
@@ -2871,8 +2874,7 @@ class ImageEditorDialog(QDialog):
 
     def _select_width(self, w):
         self.canvas.set_width(w)
-        for ww, b in self._width_btns:
-            b.setChecked(ww == w)
+        _refresh_size_buttons(self.canvas)
 
     def _toggle_crop(self):
         self.canvas.toggle_crop()
@@ -10021,6 +10023,10 @@ def main():
             return
 
         _try_open_win_firewall()
+        # Windows 区域可能启用本地数字（如 zh-Hans-MO 的〇一二…），Qt 会把字号、
+        # 进度百分比显示成〡〨；按语言/文字/地区重建区域，保留习惯但统一用 0-9。
+        sys_locale = QLocale.system()
+        QLocale.setDefault(QLocale(sys_locale.language(), sys_locale.script(), sys_locale.territory()))
         f = QFont()
         f.setFamily("PingFang SC" if platform.system() == "Darwin" else "Microsoft YaHei UI")
         f.setPointSize(13 if platform.system() == "Darwin" else 10)
