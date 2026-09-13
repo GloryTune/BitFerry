@@ -321,6 +321,47 @@ class ProductTests(unittest.TestCase):
         """
         subprocess.run([node, '-e', harness], check=True, capture_output=True)
 
+    def test_settings_name_and_screenshot_options_sync_with_main_controls(self):
+        from PyQt6.QtWidgets import QInputDialog
+        dlg = app.SettingsDialog(self.w)
+        self.addCleanup(dlg.deleteLater)
+        dlg.device_name_input.setText("  办公电脑  ")
+        dlg.chk_shot_hide.setChecked(False)
+        with patch.object(self.w.discovery, 'update_name') as broadcast:
+            dlg._save_and_accept()
+            broadcast.assert_called_once_with('办公电脑')
+        self.assertEqual(self.w.hostname, '办公电脑')
+        self.assertEqual(self.w.self_name_lbl.text(), '办公电脑')
+        self.assertEqual(self.w.webbridge.hostname, '办公电脑')
+        self.assertEqual(app.get_setting('device_name'), '办公电脑')
+        self.assertFalse(app.load_shot_hide_window())
+        self.assertFalse(self.w.act_shot_hide.isChecked())
+        with patch.object(QInputDialog, 'getText', return_value=('前台改名', True)):
+            self.w.action_rename_device()
+        self.w.act_shot_hide.setChecked(True)
+        reopened = app.SettingsDialog(self.w)
+        self.addCleanup(reopened.deleteLater)
+        self.assertEqual(reopened.device_name_input.text(), '前台改名')
+        self.assertTrue(reopened.chk_shot_hide.isChecked())
+        reopened.reject()
+
+    def test_settings_cancel_and_blank_name_do_not_apply_changes(self):
+        original_name = self.w.hostname
+        original_hide = app.load_shot_hide_window()
+        dlg = app.SettingsDialog(self.w)
+        self.addCleanup(dlg.deleteLater)
+        dlg.device_name_input.setText('未保存的名字')
+        dlg.chk_shot_hide.setChecked(not original_hide)
+        dlg.reject()
+        self.assertEqual(self.w.hostname, original_name)
+        self.assertEqual(app.load_shot_hide_window(), original_hide)
+        dlg.device_name_input.setText('   ')
+        with patch.object(app.QMessageBox, 'warning') as warning:
+            dlg._save_and_accept()
+            warning.assert_called_once()
+        self.assertEqual(self.w.hostname, original_name)
+        self.assertEqual(app.load_shot_hide_window(), original_hide)
+
     def test_dark_settings_labels_update_after_light_theme_preview(self):
         from PyQt6.QtGui import QPalette
         dlg = app.SettingsDialog(self.w)
@@ -347,6 +388,37 @@ class ProductTests(unittest.TestCase):
             self.w._load_older_session()
         self.assertLessEqual(self.w.chat_layout.count() - 1, 500)
         self.assertLess(self.w._session_start, 1000)
+
+    def test_latest_button_only_appears_away_from_latest_messages(self):
+        ip = self.w.current_ip
+        self.w.right.setCurrentIndex(1)
+        self.w.show()
+        self.w._render_session(ip)
+        self.pump(lambda: not self.w._rendering_session)
+        self.assertTrue(self.w.btn_latest.isHidden())
+        self.w.session[ip] = [
+            {'kind': 'text', 'payload': str(i), 'mine': True,
+             'name': 'Me', 'ts': '12:00', 'seq': i} for i in range(700)]
+        self.w._render_session(ip)
+        self.pump(lambda: not self.w._rendering_session)
+        bar = self.w.chat_scroll.verticalScrollBar()
+        self.assertGreater(bar.maximum(), 0)
+        self.assertTrue(self.w.btn_latest.isHidden())
+        bar.setValue(bar.maximum() // 2)
+        self.assertFalse(self.w.btn_latest.isHidden())
+        bar.setValue(bar.maximum())
+        self.assertTrue(self.w.btn_latest.isHidden())
+        for _ in range(5):
+            self.w._load_older_session()
+            self.pump(lambda: not self.w._rendering_session)
+        self.assertLess(self.w._session_end, 700)
+        bar.setValue(bar.maximum())
+        self.assertFalse(self.w.btn_latest.isHidden())
+        self.w.btn_latest.click()
+        self.pump(lambda: not self.w._rendering_session)
+        self.assertEqual(self.w._session_end, 700)
+        self.assertEqual(bar.value(), bar.maximum())
+        self.assertTrue(self.w.btn_latest.isHidden())
 
     def test_mobile_restart_generates_new_ids(self):
         first = app.WebBridge('Host', Mock(), Mock(), Mock())

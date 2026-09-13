@@ -50,7 +50,7 @@ from PyQt6.QtWidgets import (
     QMessageBox, QPlainTextEdit, QSizePolicy, QScrollArea, QTextEdit,
     QStackedWidget, QSpacerItem, QSystemTrayIcon, QMenu, QDialog, QLineEdit,
     QProgressBar, QRadioButton, QButtonGroup, QToolButton, QCheckBox,
-    QTableWidget, QTableWidgetItem, QHeaderView, QComboBox,
+    QTableWidget, QTableWidgetItem, QHeaderView, QComboBox, QStyle,
 )
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 
@@ -67,7 +67,7 @@ TRANSFER_PORT = 50809
 
 # ---------- 版本 / 在线更新 ----------
 # 发版时同步修改此处与 bitferry.spec 里的 CFBundleShortVersionString。
-__version__ = "2.0"
+__version__ = "2.01"
 GITHUB_REPO = "GloryTune/BitFerry"
 GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases/latest"
 # 检查更新走仓库里的 version.json(经 raw CDN, 不受 api.github.com 60次/小时限流);
@@ -560,7 +560,7 @@ _STYLE_TPL = (
     "#settingsContent QLabel#selfLabel {{ color:{t2}; }}\n"
     # 主窗口 — 深色主题用纯色，浅色主题用微渐变
     "QMainWindow, #root {{ background: {win_bg}; }}\n"
-    "#sidebar {{ background: {sidebar_bg}; border-right: 2px solid {sidebar_border}; }}\n"
+    "#sidebar {{ background: {sidebar_bg}; border-right: 1px solid {sidebar_border}; }}\n"
     "#brand {{ color:{t1}; font-size:17px; font-weight:700; letter-spacing:0.5px; }}\n"
     "#brandSub {{ color:{accent}; font-size:11px; font-weight:600; letter-spacing:1.5px; }}\n"
     "#selfCard {{ background:{s1}; border:1px solid {b1}; border-radius:{card_r}; }}\n"
@@ -568,18 +568,25 @@ _STYLE_TPL = (
     "#selfName {{ color:{t1}; font-size:14px; font-weight:600; }}\n"
     "#selfIp {{ color:{t2}; font-size:12px; }}\n"
     "#recvPath {{ color:{t2}; font-size:11px; }}\n"
+    "QLineEdit#deviceNameInput {{ background:{s2}; color:{t1}; border:1px solid {b2};"
+        " border-radius:{btn_r}; padding:8px; font-size:12px; selection-background-color:{accent}; }}\n"
+    "QLineEdit#deviceNameInput:focus {{ border:1px solid {accent}; }}\n"
     "QPushButton#miniBtn {{ background:{s2}; color:{t2}; border:1px solid {b2};"
         " border-radius:{btn_r}; padding:6px 0; font-size:11px; font-weight:600; }}\n"
     "QPushButton#miniBtn:hover {{ background:{s3}; border:1px solid {accent}; color:{t1}; }}\n"
+    "QPushButton#recvFolderBtn {{ background:{s2}; color:{t2}; border:1px solid {b1};"
+        " border-radius:16px; padding:7px 12px; font-size:11px; font-weight:500; }}\n"
+    "QPushButton#recvFolderBtn:hover {{ background:{s3}; color:{accent}; border-color:{accent}; }}\n"
+    "QPushButton#recvFolderBtn:pressed {{ background:{s4}; }}\n"
     "#sectionLabel {{ color:{t3}; font-size:10px; font-weight:700; letter-spacing:1.5px; }}\n"
     "QListWidget {{ background:transparent; border:none; outline:none; }}\n"
     "QListWidget::item {{ background:{li}; border:1px solid {li_b}; border-radius:{item_r}; margin-bottom:8px; }}\n"
     "QListWidget::item:hover {{ background:{lh}; border:1px solid {lh_b}; }}\n"
     "QListWidget::item:selected {{ background:{ls}; border:1px solid {accent}; }}\n"
     "#peerName {{ color:{t1}; font-size:13px; font-weight:600; }}\n"
-    "#peerNameOff {{ color:{t4}; font-size:13px; font-weight:600; }}\n"
+    "#peerNameOff {{ color:{t2}; font-size:13px; font-weight:600; }}\n"
     "#peerIp {{ color:{t2}; font-size:11px; }}\n"
-    "#peerIpOff {{ color:{t7}; font-size:11px; }}\n"
+    "#peerIpOff {{ color:{t3}; font-size:11px; }}\n"
     "#dotOn {{ color:{online}; font-size:13px; }}\n"
     "#dotOff {{ color:{offline}; font-size:13px; }}\n"
     "#chatHeader {{ background:{panel_bg}; border-bottom:1px solid {panel_border}; }}\n"
@@ -624,9 +631,9 @@ _STYLE_TPL = (
         " border-radius:{btn_r}; padding:10px 22px; }}\n"
     "QPushButton#primary:hover {{ background:{accent_hover}; }}\n"
     "QPushButton#primary:disabled {{ background:{s2}; color:{t4}; }}\n"
-    "QPushButton#tool {{ background:transparent; border:none; font-size:18px; padding:4px 8px; }}\n"
+    "QPushButton#tool {{ background:transparent; border:none; font-size:12px; padding:6px 8px; }}\n"
     "QPushButton#tool:hover {{ background:{s2}; border-radius:{btn_r}; }}\n"
-    "QToolButton#tool {{ background:transparent; color:{t1}; border:none; font-size:18px; padding:4px 8px; }}\n"
+    "QToolButton#tool {{ background:transparent; color:{t1}; border:none; font-size:12px; padding:6px 8px; }}\n"
     "QToolButton#tool:hover {{ background:{s2}; border-radius:{btn_r}; }}\n"
     "QToolButton#tool::menu-button {{ background:transparent; border:none; width:14px; }}\n"
     "QToolButton#tool::menu-arrow {{ width:8px; height:8px; }}\n"
@@ -5390,8 +5397,8 @@ class HistoryDialog(QDialog):
 
 class SendQueueDialog(QDialog):
     """发送任务以部件为单位重试或撤销，已成功的部件不会重复发送。"""
-    def __init__(self, parent):
-        super().__init__(parent)
+    def __init__(self, parent, dialog_parent=None):
+        super().__init__(dialog_parent or parent)
         self.window = parent
         self.setWindowTitle("发送队列")
         self.resize(760, 460)
@@ -5651,6 +5658,9 @@ class SettingsDialog(QDialog):
         self._build()
         self._refresh_theme_controls()
 
+    def _change_recv_dir(self):
+        self.parent().action_change_recv_dir(dialog_parent=self)
+
     def _refresh_theme_controls(self):
         for widget in self.findChildren(QWidget):
             if isinstance(widget, (QLabel, QCheckBox, QRadioButton)):
@@ -5677,13 +5687,67 @@ class SettingsDialog(QDialog):
         lay.setSpacing(16)
         lay.setContentsMargins(24, 22, 24, 22)
 
+        device_box = QFrame()
+        device_box.setObjectName("selfCard")
+        device = QVBoxLayout(device_box)
+        device.setContentsMargins(16, 14, 16, 14)
+        title = QLabel("本机名称")
+        title.setObjectName("selfName")
+        device.addWidget(title)
+        self.device_name_input = QLineEdit(self.parent().hostname)
+        self.device_name_input.setPlaceholderText("让其他设备认出这台电脑")
+        self.device_name_input.setAccessibleName("本机名称")
+        self.device_name_input.setObjectName("deviceNameInput")
+        device.addWidget(self.device_name_input)
+        hint = QLabel("也可以直接点击主界面左侧的本机名称修改。")
+        hint.setObjectName("recvPath")
+        hint.setWordWrap(True)
+        device.addWidget(hint)
+        lay.addWidget(device_box)
+
+        # 常用管理入口归入设置，主界面专注设备和聊天。
+        manage_box = QFrame()
+        manage_box.setObjectName("selfCard")
+        manage = QVBoxLayout(manage_box)
+        manage.setContentsMargins(16, 14, 16, 14)
+        title = QLabel("传输与存储")
+        title.setObjectName("selfName")
+        manage.addWidget(title)
+        path_label = QLabel(str(RECV_ROOT))
+        path_label.setObjectName("recvPath")
+        path_label.setWordWrap(True)
+        manage.addWidget(path_label)
+        directory_row = QHBoxLayout()
+        for text, callback in (("更改接收目录", self._change_recv_dir),
+                               ("打开目录", self.parent().action_open_recv)):
+            button = QPushButton(text)
+            button.setObjectName("miniBtn")
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.clicked.connect(lambda checked=False, cb=callback: (
+                cb(), path_label.setText(str(RECV_ROOT))))
+            directory_row.addWidget(button)
+        manage.addLayout(directory_row)
+        tools_row = QHBoxLayout()
+        self.btn_send_queue = QPushButton("发送队列")
+        self.btn_send_queue.clicked.connect(
+            lambda: SendQueueDialog(self.parent(), dialog_parent=self).exec())
+        self.btn_diagnostics = QPushButton("日志与存储")
+        self.btn_diagnostics.clicked.connect(
+            lambda: self.parent().action_diagnostics(dialog_parent=self))
+        for button in (self.btn_send_queue, self.btn_diagnostics):
+            button.setObjectName("miniBtn")
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            tools_row.addWidget(button)
+        manage.addLayout(tools_row)
+        lay.addWidget(manage_box)
+
         # --- 截图快捷键区块 ---
         sc_box = QFrame()
         sc_box.setObjectName("selfCard")
         sc_lay = QVBoxLayout(sc_box)
         sc_lay.setContentsMargins(16, 14, 16, 14)
         sc_lay.setSpacing(8)
-        sc_title = QLabel("截图快捷键")
+        sc_title = QLabel("截图行为")
         sc_title.setObjectName("selfName")
         sc_lay.addWidget(sc_title)
         sc_hint = QLabel("点击下方框后按下组合键（默认 Alt+Shift+A）")
@@ -5702,6 +5766,12 @@ class SettingsDialog(QDialog):
                      setattr(self.shortcut_cap, "_seq", DEFAULT_SHORTCUT)))
         sc_reset_row.addWidget(btn_reset)
         sc_lay.addLayout(sc_reset_row)
+        self.chk_shot_hide = QCheckBox("截图时隐藏本窗口")
+        self.chk_shot_hide.setChecked(load_shot_hide_window())
+        sc_lay.addWidget(self.chk_shot_hide)
+        self.chk_focus_shot = QCheckBox("截图完成后将本应用窗口置顶并聚焦")
+        self.chk_focus_shot.setChecked(load_focus_after_shot())
+        sc_lay.addWidget(self.chk_focus_shot)
         lay.addWidget(sc_box)
 
         # --- 接收行为区块 ---
@@ -5745,13 +5815,9 @@ class SettingsDialog(QDialog):
         wb_title = QLabel("窗口行为")
         wb_title.setObjectName("selfName")
         wb_lay.addWidget(wb_title)
-        self.chk_focus_shot = QCheckBox("截图完成后将本应用窗口置顶并聚焦")
         self.chk_focus_recv = QCheckBox("收到其他设备消息后将本应用窗口置顶并聚焦")
-        self.chk_focus_shot.setStyleSheet(f"color:{rc}; font-size:12px;")
         self.chk_focus_recv.setStyleSheet(f"color:{rc}; font-size:12px;")
-        self.chk_focus_shot.setChecked(load_focus_after_shot())
         self.chk_focus_recv.setChecked(load_focus_on_recv())
-        wb_lay.addWidget(self.chk_focus_shot)
         wb_lay.addWidget(self.chk_focus_recv)
 
         # 关闭=最小化到托盘 / 开机自启动
@@ -5925,6 +5991,15 @@ class SettingsDialog(QDialog):
         self._apply_size(w, h)
 
     def _save_and_accept(self):
+        name = self.device_name_input.text().strip()
+        if not name:
+            QMessageBox.warning(self, "本机名称", "请输入本机名称，方便其他设备识别。")
+            self.device_name_input.setFocus()
+            return
+        self.parent()._set_device_name(name)
+        hide_window = self.chk_shot_hide.isChecked()
+        set_setting("shot_hide_window", hide_window)
+        self.parent().act_shot_hide.setChecked(hide_window)
         seq = self.shortcut_cap.sequence()
         if seq:
             set_setting("shot_shortcut", seq)
@@ -6339,8 +6414,9 @@ class ChatInput(QTextEdit):
         super().__init__()
         self.setObjectName("chatInput")
         self.setPlaceholderText(
-            "输入消息，Enter 发送，Shift+Enter 换行。可直接粘贴/拖入截图(显示缩略图)与文件。")
+            "输入消息，或粘贴 / 拖入图片与文件…")
         self.setMinimumHeight(96)
+        self.setMaximumHeight(160)
         self.setAcceptDrops(True)
         self._img_counter = 0
         # 资源名 -> 真实文件路径, 用于发送时还原
@@ -6944,7 +7020,8 @@ class MainWindow(QMainWindow):
 
     def _on_receiver_status(self, ready, reason):
         self.discovery.set_receiving(ready)
-        self.recv_status_lbl.setText("● 可以接收文件" if ready else
+        self.recv_status_lbl.setVisible(not ready)
+        self.recv_status_lbl.setText("" if ready else
                                     ("⚠ 无法接收文件\n端口被占用或无访问权限" if reason else "接收服务已停止"))
         self.recv_status_lbl.setToolTip(reason or (f"接收端口：{TRANSFER_PORT}" if ready else "接收服务已停止"))
         self.btn_retry_receiver.setVisible(not ready)
@@ -7361,29 +7438,31 @@ class MainWindow(QMainWindow):
             "QToolButton#updateBadge:hover{background:#27ae60;}")
         self.btn_update_badge.clicked.connect(self._open_pending_update)
         self.btn_update_badge.hide()
-        brand_row.addWidget(self.btn_update_badge)
         brand_row.addStretch()
         sb.addLayout(brand_row)
-        sb.addWidget(self._lbl("内网快传", "brandSub"))
-        # 全局设置按钮(接收目录的打开功能在下方接收目录卡片里, 这里不重复)
-        self.btn_settings = QPushButton("⚙ 设置")
+        subtitle_row = QHBoxLayout()
+        subtitle_row.addWidget(self._lbl("内网快传", "brandSub"))
+        subtitle_row.addStretch()
+        subtitle_row.addWidget(self.btn_update_badge)
+        sb.addLayout(subtitle_row)
+        self.btn_settings = QPushButton("设置")
         self.btn_settings.setObjectName("miniBtn")
-        self.btn_settings.setToolTip("快捷键 · 接收行为 · 窗口设置")
+        self.btn_settings.setFixedWidth(48)
+        self.btn_settings.setToolTip("接收目录 · 发送队列 · 日志与存储 · 外观")
         self.btn_settings.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_settings.clicked.connect(self.action_settings)
-        sb.addWidget(self.btn_settings)
-        self.btn_send_queue = QPushButton("发送队列")
-        self.btn_send_queue.setObjectName("miniBtn")
-        self.btn_send_queue.clicked.connect(self.action_send_queue)
-        sb.addWidget(self.btn_send_queue)
+        brand_row.addWidget(self.btn_settings)
+        self.btn_help = QPushButton("使用帮助")
+        self.btn_help.setObjectName("miniBtn")
+        self.btn_help.setFixedWidth(64)
+        self.btn_help.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_help.setToolTip("快速上手 · 截图编辑 · 更多功能")
+        self.btn_help.clicked.connect(self.action_help)
+        brand_row.addWidget(self.btn_help)
         self.btn_cancel_exit = QPushButton("取消等待退出")
         self.btn_cancel_exit.clicked.connect(self._cancel_wait_exit)
         self.btn_cancel_exit.hide()
         sb.addWidget(self.btn_cancel_exit)
-        maintenance = QPushButton("日志与存储")
-        maintenance.setObjectName("miniBtn")
-        maintenance.clicked.connect(self.action_diagnostics)
-        sb.addWidget(maintenance)
 
         selfCard = QFrame()
         selfCard.setObjectName("selfCard")
@@ -7399,7 +7478,8 @@ class MainWindow(QMainWindow):
             lambda e: self.action_rename_device())
         sc.addWidget(self.self_name_lbl)
         sc.addWidget(self._lbl(self.local_ip, "selfIp"))
-        self.recv_status_lbl = self._lbl("正在启动接收服务…", "selfIp")
+        self.recv_status_lbl = self._lbl("", "selfIp")
+        self.recv_status_lbl.hide()
         self.recv_status_lbl.setWordWrap(True)
         sc.addWidget(self.recv_status_lbl)
         self.btn_retry_receiver = QPushButton("重试接收")
@@ -7409,32 +7489,6 @@ class MainWindow(QMainWindow):
         sc.addWidget(self.btn_retry_receiver)
         sb.addWidget(selfCard)
 
-        # 接收目录卡片
-        recvCard = QFrame()
-        recvCard.setObjectName("selfCard")
-        rc = QVBoxLayout(recvCard)
-        rc.setContentsMargins(14, 12, 14, 12)
-        rc.setSpacing(6)
-        rc.addWidget(self._lbl("接收目录", "selfLabel"))
-        self.recv_path_lbl = self._lbl(str(RECV_ROOT), "recvPath")
-        self.recv_path_lbl.setWordWrap(True)
-        self.recv_path_lbl.setToolTip(str(RECV_ROOT))
-        rc.addWidget(self.recv_path_lbl)
-        rcbtns = QHBoxLayout()
-        rcbtns.setSpacing(6)
-        btn_change = QPushButton("更改位置")
-        btn_change.setObjectName("miniBtn")
-        btn_change.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_change.clicked.connect(self.action_change_recv_dir)
-        btn_open2 = QPushButton("打开")
-        btn_open2.setObjectName("miniBtn")
-        btn_open2.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_open2.clicked.connect(self.action_open_recv)
-        rcbtns.addWidget(btn_change)
-        rcbtns.addWidget(btn_open2)
-        rc.addLayout(rcbtns)
-        sb.addWidget(recvCard)
-
         # 设备栏标题行 + 刷新按钮
         dev_hdr = QHBoxLayout()
         dev_hdr.setSpacing(6)
@@ -7442,18 +7496,21 @@ class MainWindow(QMainWindow):
         dev_hdr.addStretch()
         self.btn_refresh = QPushButton("刷新")
         self.btn_refresh.setObjectName("miniBtn")
+        self.btn_refresh.setMinimumWidth(40)
         self.btn_refresh.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_refresh.setToolTip("重新扫描局域网设备")
         self.btn_refresh.clicked.connect(self.action_refresh_devices)
         dev_hdr.addWidget(self.btn_refresh)
         btn_net = QPushButton("网段")
         btn_net.setObjectName("miniBtn")
+        btn_net.setMinimumWidth(40)
         btn_net.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_net.setToolTip("设置广播网段（跨子网/VPN 时使用）")
         btn_net.clicked.connect(self.action_network_settings)
         dev_hdr.addWidget(btn_net)
         btn_web = QPushButton("手机")
         btn_web.setObjectName("miniBtn")
+        btn_web.setMinimumWidth(40)
         btn_web.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_web.setToolTip("手机网页版：手机扫码即可与本机互传文件/聊天")
         btn_web.clicked.connect(self.action_web_access)
@@ -7470,6 +7527,14 @@ class MainWindow(QMainWindow):
         self.empty_hint = self._lbl("尚未发现设备\n确保对方也打开了 BitFerry", "emptyHint")
         self.empty_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         sb.addWidget(self.empty_hint)
+        self.btn_open_recv = QPushButton("打开接收文件夹")
+        self.btn_open_recv.setObjectName("recvFolderBtn")
+        self.btn_open_recv.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DirOpenIcon))
+        self.btn_open_recv.setIconSize(QSize(16, 16))
+        self.btn_open_recv.setToolTip(str(RECV_ROOT))
+        self.btn_open_recv.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_open_recv.clicked.connect(self.action_open_recv)
+        sb.addWidget(self.btn_open_recv, 0, Qt.AlignmentFlag.AlignLeft)
         outer.addWidget(sidebar)
 
         # ===== 右侧聊天区 =====
@@ -7555,14 +7620,20 @@ class MainWindow(QMainWindow):
         browse = QHBoxLayout()
         self._older_messages = QPushButton("加载更早消息")
         self._older_messages.clicked.connect(self._load_older_session)
-        latest = QPushButton("回到最新")
-        latest.clicked.connect(lambda: self._render_session(self.current_ip))
+        self.btn_latest = QPushButton("回到最新")
+        self.btn_latest.setObjectName("miniBtn")
+        self.btn_latest.setMinimumWidth(80)
+        self.btn_latest.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_latest.clicked.connect(lambda: self._render_session(self.current_ip))
+        self.btn_latest.hide()
+        # 放在固定高度的会话标题栏，显隐时不会挤动消息或改变滚动位置。
+        hl.addWidget(self.btn_latest)
         browse.addWidget(self._older_messages)
         browse.addStretch()
-        browse.addWidget(latest)
         cl.addLayout(browse)
         cl.addWidget(self.chat_scroll, 1)
         self.chat_scroll.verticalScrollBar().valueChanged.connect(self._on_chat_scroll)
+        self.chat_scroll.verticalScrollBar().rangeChanged.connect(self._refresh_latest_button)
 
         # 输入区(待发内容直接显示在输入框里: 截图缩略图内嵌, 文件以 chip 行紧贴显示)
         compose = QFrame()
@@ -7588,17 +7659,17 @@ class MainWindow(QMainWindow):
             lambda v: set_setting("shot_hide_window", bool(v)))
         shot_menu.addAction(self.act_shot_hide)
         btn_shot.setMenu(shot_menu)
-        btn_paste = QPushButton("📋 粘贴")
+        btn_paste = QPushButton("粘贴")
         btn_paste.setObjectName("tool")
         btn_paste.setToolTip("把剪贴板里的截图或文件放入输入框")
         btn_paste.clicked.connect(self.action_paste_clipboard)
-        btn_addfile = QPushButton("📎 文件")
+        btn_addfile = QPushButton("文件")
         btn_addfile.setObjectName("tool")
         btn_addfile.clicked.connect(self.action_attach_file)
-        btn_addfolder = QPushButton("📁 文件夹")
+        btn_addfolder = QPushButton("文件夹")
         btn_addfolder.setObjectName("tool")
         btn_addfolder.clicked.connect(self.action_send_folder)
-        self.btn_history = QPushButton("🕘 聊天记录")
+        self.btn_history = QPushButton("聊天记录")
         self.btn_history.setObjectName("tool")
         self.btn_history.setToolTip("查看与该设备的历史聊天记录")
         self.btn_history.clicked.connect(self.action_open_history)
@@ -7627,6 +7698,7 @@ class MainWindow(QMainWindow):
 
         # 发送按钮行
         send_row = QHBoxLayout()
+        send_row.addWidget(self._lbl("Enter 发送 · Shift+Enter 换行", "recvPath"))
         send_row.addStretch()
         self.send_btn = QPushButton("发送")
         self.send_btn.setObjectName("primary")
@@ -7657,7 +7729,11 @@ class MainWindow(QMainWindow):
             text=cur)
         if not ok or not new_name.strip():
             return
-        new_name = new_name.strip()
+        self._set_device_name(new_name.strip())
+
+    def _set_device_name(self, new_name):
+        if new_name == self.hostname:
+            return
         set_setting("device_name", new_name)
         self.hostname = new_name
         self.self_name_lbl.setText(new_name)
@@ -8018,8 +8094,17 @@ class MainWindow(QMainWindow):
         return sorted(messages, key=lambda m: m.get("seq", 0))
 
     def _on_chat_scroll(self, value):
+        self._refresh_latest_button()
         if value == 0 and not getattr(self, "_rendering_session", False) and self.chat_scroll.underMouse():
             self._load_older_session()
+
+    def _refresh_latest_button(self, *_):
+        if getattr(self, "_rendering_session", False):
+            return
+        total = self._session_count(self.current_ip) if self.current_ip else 0
+        bar = self.chat_scroll.verticalScrollBar()
+        older_page = getattr(self, "_session_end", total) < total
+        self.btn_latest.setVisible(bool(total) and (older_page or bar.value() < bar.maximum()))
 
     def _load_older_session(self):
         if self.current_ip and getattr(self, "_session_start", 0) > 0:
@@ -8049,6 +8134,7 @@ class MainWindow(QMainWindow):
         def restore():
             bar.setValue(max(0, old_value + bar.maximum() - old_max) if older else bar.maximum())
             self._rendering_session = False
+            self._refresh_latest_button()
         QTimer.singleShot(0, restore)
 
     def _add_divider(self, text):
@@ -8061,7 +8147,7 @@ class MainWindow(QMainWindow):
         if not getattr(self, "_building_session", False) and self.current_ip:
             total = self._session_count(self.current_ip)
             if getattr(self, "_session_end", total) < total - 1:
-                self._older_messages.setText("有新消息 · 点击回到最新查看")
+                self._refresh_latest_button()
                 return None
         b = Bubble(m["kind"], m["payload"], m["mine"], m["ts"], m["name"],
                    m.get("pending", False), m.get("delivery"))
@@ -8079,6 +8165,7 @@ class MainWindow(QMainWindow):
             self._session_end = total
             self._session_start = max(0, total - (self.chat_layout.count() - 1))
             self._older_messages.setVisible(self._session_start > 0)
+            self._refresh_latest_button()
         mid = m.get("msg_id")
         if mid:
             self._bubbles_by_id[mid] = b
@@ -8753,6 +8840,72 @@ class MainWindow(QMainWindow):
     def action_set_shortcut(self):
         self.action_settings()
 
+    def action_help(self):
+        """短教程使用实际功能入口，首次使用即可照着操作。"""
+        from PyQt6.QtWidgets import QScrollArea
+        dialog = QDialog(self)
+        dialog.setWindowTitle("使用帮助")
+        dialog.setStyleSheet(STYLE)
+        layout = QVBoxLayout(dialog)
+        scroll = QScrollArea()
+        scroll.setObjectName("settingsScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        content = QWidget()
+        content.setObjectName("settingsContent")
+        cards = QVBoxLayout(content)
+        cards.setContentsMargins(12, 12, 12, 12)
+        cards.setSpacing(12)
+        sections = (
+            ("三步开始互传", "① 两台电脑连接同一局域网，并打开 BitFerry。\n"
+             "② 在左侧选择对方设备；没看到就点「刷新」。\n"
+             "③ 输入文字，或点「文件 / 文件夹」添加内容，再点「发送」。\n"
+             "也能直接粘贴或拖入图片与文件。Enter 发送，Shift+Enter 换行。"),
+            ("截图，还能编辑", "点「截图」或按设置中的截图快捷键（默认 Alt+Shift+A），拖动选择区域。\n"
+             "选好后可加矩形、椭圆、箭头、画笔和文字，调整颜色、线宽或文字大小；支持撤销。\n"
+             "点 ✓ 完成，截图会放进输入框，再点「发送」；Esc 取消截图。\n"
+             "双击输入框里的图片，还能继续标注、裁剪、旋转；双击文字标注可改内容。\n"
+             "「截图」旁的小箭头和「设置 → 截图行为」都能设置是否隐藏本窗口。"),
+            ("接收文件与手机互传", "收到的文件会按发送方名称归档，点左下角「打开接收文件夹」查看。\n"
+             "在设置中可更改接收目录，或开启手动确认，挑选要接收的文件。\n"
+             "手机连接同一局域网，点设备栏的「手机」，按提示扫码或打开网址即可互传。"),
+            ("离线发送与发送队列", "对方离线时也能提交发送，任务会等待对方上线；等待期间请保持本应用运行。\n"
+             "「设置 → 发送队列」可查看、重试或撤销任务；未确认的任务，先问对方是否收到。\n"
+             "传输时，聊天区上方会显示进度；发送中的文件可暂停、继续或取消。"),
+            ("聊天记录与图片小技巧", "点「聊天记录」按文字、文件名或日期搜索历史消息。切换设备时，未发送的内容会保留为草稿。\n"
+             "双击聊天里的图片可编辑，完成后复制到剪贴板，粘贴即可再次发送；右键图片可复制或另存为。"),
+            ("名字、外观与排查问题", "在设置中修改本机名称，也可以直接点击左侧本机名称。设置里还能调整主题、窗口大小和置顶行为。\n"
+             "右键离线设备可删除旧设备；跨子网或 VPN 时，可通过「网段」补充发现范围。\n"
+             "遇到问题到「设置 → 日志与存储」查看日志、导出诊断或清理缓存。接收异常时，主界面会提示并提供重试。"),
+        )
+        for title, text in sections:
+            card = QFrame()
+            card.setObjectName("selfCard")
+            body = QVBoxLayout(card)
+            body.setContentsMargins(16, 14, 16, 14)
+            body.setSpacing(8)
+            body.addWidget(self._lbl(title, "selfName"))
+            label = self._lbl(text, "selfIp")
+            label.setWordWrap(True)
+            label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            body.addWidget(label)
+            cards.addWidget(card)
+        cards.addStretch()
+        scroll.setWidget(content)
+        layout.addWidget(scroll, 1)
+        done = QPushButton("开始使用")
+        done.setObjectName("primary")
+        done.clicked.connect(dialog.accept)
+        layout.addWidget(done, 0, Qt.AlignmentFlag.AlignRight)
+        screen = self.screen()
+        available = screen.availableGeometry() if screen else self.geometry()
+        dialog.resize(min(620, available.width() - 40), min(720, available.height() - 60))
+        try:
+            dialog.exec()
+        finally:
+            dialog.deleteLater()
+
     def action_settings(self):
         dlg = SettingsDialog(self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
@@ -8934,8 +9087,8 @@ class MainWindow(QMainWindow):
             return cache_inventory(images, temporary, references)
         return scan
 
-    def action_diagnostics(self):
-        dialog = QDialog(self)
+    def action_diagnostics(self, *, dialog_parent=None):
+        dialog = QDialog(dialog_parent or self)
         dialog.setWindowTitle("日志与存储")
         dialog.resize(760, 560)
         dialog.setStyleSheet(_task_dialog_style())
@@ -9487,11 +9640,12 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self._append_log(f"无法打开目录: {e}", "error")
 
-    def action_change_recv_dir(self):
+    def action_change_recv_dir(self, *, dialog_parent=None):
         global RECV_ROOT
+        owner = dialog_parent or self
         start = str(RECV_ROOT) if RECV_ROOT.exists() else str(Path.home())
         chosen = QFileDialog.getExistingDirectory(
-            self, "选择接收文件的保存位置", start)
+            owner, "选择接收文件的保存位置", start)
         if not chosen:
             return
         new_root = Path(chosen)
@@ -9502,18 +9656,17 @@ class MainWindow(QMainWindow):
             test.write_text("ok", encoding="utf-8")
             test.unlink()
         except Exception as e:
-            QMessageBox.warning(self, "无法使用该目录",
+            QMessageBox.warning(owner, "无法使用该目录",
                                 f"该位置不可写入，请换一个：\n{e}")
             return
         RECV_ROOT = new_root
         self._diagnostics.root = new_root
         self._diagnostics.record("info", f"接收目录已更改：{new_root}")
         save_recv_root(new_root)
-        self.recv_path_lbl.setText(str(new_root))
-        self.recv_path_lbl.setToolTip(str(new_root))
+        self.btn_open_recv.setToolTip(str(new_root))
         self._append_log(f"接收目录已改为 {new_root}", "info")
         QMessageBox.information(
-            self, "已更新",
+            owner, "已更新",
             f"新收到的文件将保存到：\n{new_root}\n\n"
             f"仍会按发送方机器名自动归档到子文件夹。\n"
             f"（聊天记录和聊天图片不受影响，保留在原应用数据目录）")

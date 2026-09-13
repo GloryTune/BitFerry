@@ -10,7 +10,7 @@
 
 | 平台 | 下载 |
 |------|------|
-| **Windows 10/11 x64** | [BitFerry-windows-x64.exe](https://github.com/GloryTune/BitFerry/releases/latest/download/BitFerry-windows-x64.exe) |
+| **Windows 10/11 x64** | [BitFerry-windows-x64.exe](https://github.com/GloryTune/BitFerry/releases/download/v2.0/BitFerry-windows-x64.exe) |
 | **macOS (Apple Silicon)** | [BitFerry-macos-arm64.zip](https://github.com/GloryTune/BitFerry/releases/latest/download/BitFerry-macos-arm64.zip) |
 
 > **macOS 提示**：解压后将 `BitFerry.app` 拖入应用程序文件夹。首次打开若提示"无法验证开发者"，前往 **系统设置 → 隐私与安全性** 点击「仍要打开」。
@@ -300,7 +300,7 @@ MIT License
 - 存在网络传输、附件检查或后台接收处理时，退出会询问是否等待完成；等待期间暂停新任务，侧栏可以取消等待。暂停中的发送须先恢复或撤销。安装更新也会等待当前任务完成。
 - 大批量附件在后台检查，过程中切换会话或修改输入不会直接发送新草稿；草稿按顺序在后台保存，正常退出会等待保存完成。
 - 发送队列支持按接收设备、状态筛选，选中多行后批量重试或撤销。设备列显示创建任务时绑定的接收方。
-- 侧栏「日志与存储」可统计截图与暂存文件占用。仅清理超过 24 小时且未被历史、草稿、任务、待接收清单或下载登记引用的缓存；不删除正式接收目录中的文件。
+- 「设置 → 日志与存储」可统计截图与暂存文件占用。仅清理超过 24 小时且未被历史、草稿、任务、待接收清单或下载登记引用的缓存；不删除正式接收目录中的文件。
 
 ### 操作日志
 
@@ -315,12 +315,16 @@ MIT License
 - 侧栏「待发」只统计仍会自动发送的任务，已送达、已撤销和未确认的任务不计入。
 - 修复 Windows 上并发接收同名文件时，路径解析偶发保留 `\\?\` 前缀导致误判越界拒收。
 
-### 发布 2.0
+### 2.01 界面与使用体验
 
-Windows 包已上传到 `v2.0` Release，`version.json` 目前只列出 Windows 文件。macOS 包在 Mac 上构建后上传：
+- 发送队列、日志与存储归入设置，主界面突出设备和聊天；接收文件夹使用紧凑快捷按钮。
+- “回到最新”只在离开最新消息时显示，正常接收状态不再常驻提示。
+- 设置可修改本机名称、设置截图时是否隐藏窗口，与主界面入口同步。
+- 设置旁新增使用帮助，覆盖首次互传、截图编辑、手机互传、离线队列与历史搜索。
+- 优化输入区、工具栏和离线设备文字对比度。
 
-```bash
-gh release upload v2.0 BitFerry-macos-arm64.zip --repo GloryTune/BitFerry
-```
+### 发布 2.01
 
-上传完成后，在 `version.json` 的 `assets` 中加入 `"darwin": "BitFerry-macos-arm64.zip"`，提交并推送到 `main`，再核对 Release 下载链接。更新清单不提供尚未上传的文件。
+本次提供 macOS Apple Silicon 独立应用，版本号为 `2.01`，发布标签为 `v2.01`。
+Windows 预编译包仍为 `v2.0`；最新 Windows 源码可按上方步骤自行构建。
+`version.json` 仅列出本次实际发布的 macOS 资产。
