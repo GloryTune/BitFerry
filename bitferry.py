@@ -28,7 +28,7 @@ import re
 import hmac
 import queue
 import mimetypes
-from history_store import HistoryStore
+from history_store import HistoryStore, belongs_to_device
 from diagnostics import DailyLog, SerialWriter, collect_paths, cache_inventory, delete_cache_candidates
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
@@ -5217,9 +5217,9 @@ class HistoryDialog(QDialog):
     page_ready = pyqtSignal(int, int, int, object, str)
     PAGE_SIZE = 50
 
-    def __init__(self, parent, peer_name, msgs, on_retry=None, store=None, ips=None):
+    def __init__(self, parent, peer_name, msgs, on_retry=None, store=None, ips=None, devs=None):
         super().__init__(parent)
-        self._store, self._ips = store, tuple(ips or [])
+        self._store, self._ips, self._devs = store, tuple(ips or []), tuple(devs or [])
         self._closed = False
         self._query_cancel = threading.Event()
         self._page = 0
@@ -5314,13 +5314,13 @@ class HistoryDialog(QDialog):
             self._query_cancel = threading.Event()
             cancel = self._query_cancel
             generation, query = self._generation, self.search.text().strip()
-            store, ips, signal = self._store, self._ips, self.page_ready
+            store, ips, devs, signal = self._store, self._ips, self._devs, self.page_ready
             self.page_label.setText("正在读取…")
             self.previous.setEnabled(False)
             self.next.setEnabled(False)
             def worker():
                 try:
-                    total, actual, records = store.page(ips, query, page, self.PAGE_SIZE, cancel=cancel)
+                    total, actual, records = store.page(ips, query, page, self.PAGE_SIZE, cancel=cancel, devs=devs)
                     error = ""
                 except Exception as exc:
                     total, actual, records, error = 0, 0, [], str(exc)
@@ -5343,11 +5343,11 @@ class HistoryDialog(QDialog):
         self.search.blockSignals(False)
         if self._store:
             self._generation += 1
-            generation, store, ips, signal = self._generation, self._store, self._ips, self.page_ready
+            generation, store, ips, devs, signal = self._generation, self._store, self._ips, self._devs, self.page_ready
             def worker():
                 try:
-                    page = store.context_page(ips, record, self.PAGE_SIZE)
-                    total, page, records = store.page(ips, '', page, self.PAGE_SIZE)
+                    page = store.context_page(ips, record, self.PAGE_SIZE, devs=devs)
+                    total, page, records = store.page(ips, '', page, self.PAGE_SIZE, devs=devs)
                     signal.emit(generation, total, page, records, '')
                 except Exception:
                     try:
@@ -7373,9 +7373,19 @@ class MainWindow(QMainWindow):
             h = _read_json_file(HISTORY_FILE.with_suffix(".bak.json"), {})
         return h if isinstance(h, dict) else {}
 
+    def _known_identities(self):
+        """显示名 -> 设备标识，供历史库把没有设备标识的老记录认领回原设备。
+        同一个名字对应多台设备时无法区分，直接跳过，宁可不认领也不认错。"""
+        names = {}
+        for entry in self.known.values():
+            if entry.get("name") and entry.get("uid"):
+                names.setdefault(entry["name"], set()).add(f'uid:{entry["uid"]}')
+        return {name: keys.pop() for name, keys in names.items() if len(keys) == 1}
+
     def _load_history(self):
         try:
-            return HistoryStore(HISTORY_FILE.with_suffix(".sqlite3"), self._read_legacy_history)
+            return HistoryStore(HISTORY_FILE.with_suffix(".sqlite3"),
+                                self._read_legacy_history, self._known_identities)
         except Exception as exc:
             _log_persist_error("打开历史数据库，暂用原记录", exc)
             return self._read_legacy_history()
@@ -7784,7 +7794,7 @@ class MainWindow(QMainWindow):
 
     def _delete_peer(self, ip):
         identity = self._device_key(ip)
-        aliases = {addr for addr in self.known if self._device_key(addr) == identity} | {ip}
+        aliases, devs = self._device_scope(ip)
         tasks = [(addr, e) for addr, entries in self.offline_queue.items() for e in entries
                  if e.get("recipient") == identity or (not e.get("recipient") and addr in aliases)]
         if tasks:
@@ -7812,9 +7822,17 @@ class MainWindow(QMainWindow):
             if addr.startswith("web:") and hasattr(self, "webbridge"):
                 self.webbridge.forget(addr)
             self.known.pop(addr, None)
-            if addr in self.history:
-                del self.history[addr]
-            self.session.pop(addr, None)
+        if isinstance(self.history, HistoryStore):
+            self.history.delete_device(aliases, devs)
+        else:
+            for addr in aliases:
+                self.history.pop(addr, None)
+        for addr, records in list(self.session.items()):
+            kept = [m for m in records if not belongs_to_device(m, addr, devs, aliases)]
+            if kept:
+                self.session[addr] = kept
+            else:
+                self.session.pop(addr, None)
         self.unread.pop(identity, None)
         self._drafts.pop(identity, None)
         if self.current_ip in aliases:
@@ -7871,6 +7889,16 @@ class MainWindow(QMainWindow):
             return f"uid:{uid}"
         name = self.online.get(ip, {}).get("name") or self.known.get(ip, {}).get("name")
         return f"name:{name}" if name else f"ip:{ip}"
+
+    def _device_scope(self, ip):
+        """该设备的 (IP 集合, 设备标识集合)。查历史时 dev 优先、ip 兜底：带设备标识的
+        记录只按设备归属，IP 被别的机器拿走也不会把老对话过继给新机器。"""
+        key = self._device_key(ip)
+        ips = {k for k in (set(self.known) | set(self.online) | {ip})
+               if self._device_key(k) == key}
+        # 只有对端自报的 uid 才算可靠身份；按名字归并的老版本对端继续按 IP 兜底，
+        # 免得它改个名字就把自己的记录认不回来。
+        return ips, {key} if key.startswith("uid:") else set()
 
     def _canonical_ip(self, ip):
         """把同一台设备的多个/变化的 IP 归一到一个代表 IP。
@@ -8085,12 +8113,14 @@ class MainWindow(QMainWindow):
                 w.deleteLater()
 
     def _session_count(self, ip):
-        key = self._device_key(ip)
-        return sum(len(records) for peer, records in self.session.items() if self._device_key(peer) == key)
+        ips, devs = self._device_scope(ip)
+        return sum(1 for peer, records in self.session.items()
+                   for m in records if belongs_to_device(m, peer, devs, ips))
 
     def _session_messages(self, ip):
-        key = self._device_key(ip)
-        messages = [m for peer, records in self.session.items() if self._device_key(peer) == key for m in records]
+        ips, devs = self._device_scope(ip)
+        messages = [m for peer, records in self.session.items()
+                    for m in records if belongs_to_device(m, peer, devs, ips)]
         return sorted(messages, key=lambda m: m.get("seq", 0))
 
     def _on_chat_scroll(self, value):
@@ -8183,6 +8213,10 @@ class MainWindow(QMainWindow):
         rec = {"kind": kind, "payload": payload, "mine": mine,
                "ts": now_hm(), "name": name, "seq": self._msg_seq,
                "day": datetime.now().strftime("%Y-%m-%d")}
+        # 设备标识随记录一起落库：IP 换人后，这条记录仍然只属于当初那台设备
+        dev = self._device_key(ip)
+        if dev.startswith("uid:"):
+            rec["dev"] = dev
         if pending:
             rec["pending"] = True
         if msg_id:
@@ -9612,13 +9646,13 @@ class MainWindow(QMainWindow):
         if not ip:
             QMessageBox.information(self, "聊天记录", "请先在左侧选择一台设备。")
             return
+        ips, devs = self._device_scope(ip)
         if isinstance(self.history, HistoryStore):
-            ips = [key for key in self.history if self._device_key(key) == self._device_key(ip)]
             dlg = HistoryDialog(self, self._peer_name(ip), [], self._retry_message,
-                                store=self.history, ips=ips)
+                                store=self.history, ips=sorted(ips), devs=sorted(devs))
         else:
             messages = [m for key, records in self.history.items()
-                        if self._device_key(key) == self._device_key(ip) for m in records]
+                        for m in records if belongs_to_device(m, key, devs, ips)]
             messages.sort(key=lambda m: (m.get("day", ""), m.get("ts", ""), m.get("seq", 0)))
             dlg = HistoryDialog(self, self._peer_name(ip), messages, self._retry_message)
         try:

@@ -76,6 +76,51 @@ class ProductTests(unittest.TestCase):
             self.w._flush_offline_queue(ip)
             self.assertEqual(send.call_args.kwargs['target_ip'], '192.168.1.9')
 
+    def test_new_device_on_reused_ip_does_not_inherit_old_chat(self):
+        """DHCP 把旧设备的 IP 分给新机器后，旧设备的聊天不能出现在新机器的会话里。"""
+        ip = self.w.current_ip
+        self.w.online = {ip: {'name': 'Peer', 'uid': 'peer', 'online': True}}
+        self.w._on_chat_in('Peer', ip, 'text', '旧机器发来的消息')
+        self.w.input.insertPlainText('发给旧机器')
+        self.w.action_send()
+        self.assertEqual(len(self.w._session_messages(ip)), 2)
+
+        peers = {ip: {'name': 'Newbie', 'uid': 'newbie', 'online': True}}
+        self.w._on_peers_change(peers)                    # 同一个 IP 换成了新机器
+        self.assertEqual(self.w._session_messages(ip), [])
+        self.assertEqual(self.w._session_count(ip), 0)
+        ips, devs = self.w._device_scope(ip)
+        self.assertEqual(self.w.history.page(ips, devs=devs)[0], 0)
+
+        self.w._on_peers_change(dict(peers, **{'192.168.1.9': {'name': 'Peer', 'uid': 'peer', 'online': True}}))
+        ips, devs = self.w._device_scope('192.168.1.9')   # 旧设备换了 IP，记录跟着它走
+        self.assertEqual(self.w.history.page(ips, devs=devs)[0], 2)
+        self.assertEqual(len(self.w._session_messages('192.168.1.9')), 2)
+
+    def test_peer_without_uid_keeps_history_after_rename(self):
+        """老版本对端不上报 uid，只能按 IP 兜底，改名后记录也要还在。"""
+        ip = '192.168.1.5'
+        self.w.online = {ip: {'name': '老客户端', 'online': True}}
+        self.w._on_chat_in('老客户端', ip, 'text', '老版本发来的消息')
+        self.w.online = {ip: {'name': '改名后', 'online': True}}
+        self.w.known[ip] = {'name': '改名后'}
+        ips, devs = self.w._device_scope(ip)
+        self.assertEqual(devs, set())
+        self.assertEqual(self.w.history.page(ips, devs=devs)[0], 1)
+        self.assertEqual(len(self.w._session_messages(ip)), 1)
+
+    def test_delete_device_keeps_records_of_the_device_that_reused_the_ip(self):
+        ip = self.w.current_ip
+        self.w.online = {ip: {'name': 'Peer', 'uid': 'peer', 'online': True}}
+        self.w._on_chat_in('Peer', ip, 'text', '旧机器')
+        self.w._on_peers_change({ip: {'name': 'Newbie', 'uid': 'newbie', 'online': True}})
+        self.w._on_chat_in('Newbie', ip, 'text', '新机器')
+        self.w._delete_peer(ip)                           # 删掉新机器
+        self.w.known['192.168.1.9'] = {'name': 'Peer', 'uid': 'peer'}
+        ips, devs = self.w._device_scope('192.168.1.9')
+        total, _, records = self.w.history.page(ips, devs=devs)
+        self.assertEqual([(r['payload'], total) for r in records], [('旧机器', 1)])
+
     def test_failed_cancellation_keeps_task_and_does_not_claim_cancelled(self):
         ip = self.w.current_ip
         self.w.input.insertPlainText('keep')
