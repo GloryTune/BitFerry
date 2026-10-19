@@ -7882,13 +7882,27 @@ class MainWindow(QMainWindow):
                     QTimer.singleShot(500, lambda i=queued_ip: self._flush_offline_queue(i))
 
     def _device_key(self, ip):
-        """同一台机器的多个 IP 归并到一个 key：优先用对端上报的 uid，
-        对端旧版本没有 uid 时退回按名称归并（同名多 IP 视为一台）。"""
+        """同一台机器的多个 IP 归并到一个 key。
+
+        优先用对端自报的 uid：这是唯一可靠的身份，带 uid 的设备换 IP、跨网段都
+        照样归为一台（_canonical_ip 的既有能力，不受下面的收紧影响）。
+
+        对端是没有 uid 的旧版本时只剩名字可比，而名字是会撞的——两台 Windows
+        默认都叫 DESKTOP-ABC123，两台手工改名的也可能都叫「2号机」。撞名一旦
+        被当成同一台，设备列表会合成一项、未读会合并、消息会落进同一个聊天，
+        _canonical_ip 甚至可能把消息发到另一台机器的 IP 上。所以按名字归并只保留
+        真正说得通的那一种情形：同名的 IP 都在本机所在网段里，才当成一台机器的
+        多个 IP（多网卡、DHCP 换地址）。跨网段的同名一律各算一台，按 IP 兜底。
+
+        判定只用 IP 与名字这类稳定信息，不掺 online 里的 inbound、online 等瞬时
+        状态：这个 key 同时是未读 self.unread、草稿 self._drafts、离线队列
+        recipient 的主键，必须在上下线和重启之间保持稳定，否则一掉线就认不回来。
+        """
         uid = self.online.get(ip, {}).get("uid") or self.known.get(ip, {}).get("uid")
         if uid:
             return f"uid:{uid}"
         name = self.online.get(ip, {}).get("name") or self.known.get(ip, {}).get("name")
-        return f"name:{name}" if name else f"ip:{ip}"
+        return f"name:{name}" if name and self._same_subnet(ip) else f"ip:{ip}"
 
     def _device_scope(self, ip):
         """该设备的 (IP 集合, 设备标识集合)。查历史时 dev 优先、ip 兜底：带设备标识的
@@ -7924,6 +7938,9 @@ class MainWindow(QMainWindow):
         return sorted(same, key=rank)[0]
 
     def _same_subnet(self, ip):
+        """对端是否与本机主 LAN IP 同 /24。除了给 _canonical_ip 排序，_device_key
+        还用它限制按名字归并的范围，所以这里只能用现成的 local_ip，不能去枚举网卡
+        （每次归并都要调用，不能带上系统调用的开销）。"""
         try:
             local = getattr(self.discovery, "local_ip", "")
             return ip.split(".")[:3] == local.split(".")[:3]

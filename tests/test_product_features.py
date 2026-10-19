@@ -109,6 +109,54 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(self.w.history.page(ips, devs=devs)[0], 1)
         self.assertEqual(len(self.w._session_messages(ip)), 1)
 
+    def test_same_name_across_subnets_without_uid_are_two_devices(self):
+        """两台撞名的无 uid 老设备分处不同网段时，不能被当成同一台。"""
+        near, far = '192.168.1.5', '10.0.0.5'          # 本机是 192.168.1.1
+        self.w.online = {near: {'name': 'DESKTOP-ABC123', 'online': True},
+                         far: {'name': 'DESKTOP-ABC123', 'online': True}}
+        self.w.known = {near: {'name': 'DESKTOP-ABC123'}, far: {'name': 'DESKTOP-ABC123'}}
+        self.w.current_ip = None
+        self.assertNotEqual(self.w._device_key(near), self.w._device_key(far))
+        # 列表里是两项，各自的代表 IP 就是自己，消息不会发到另一台机器上
+        self.assertEqual(self.w._canonical_ip(near), near)
+        self.assertEqual(self.w._canonical_ip(far), far)
+        self.w._rebuild_peer_list()
+        self.assertEqual(sorted(self.w._peer_list_state), [far, near])
+        # 各自的历史互不串台
+        self.w._on_chat_in('DESKTOP-ABC123', near, 'text', '同网段那台')
+        ips, devs = self.w._device_scope(far)
+        self.assertEqual(ips, {far})
+        self.assertEqual(self.w.history.page(ips, devs=devs)[0], 0)
+        self.assertEqual(self.w._session_messages(far), [])
+
+    def test_same_name_in_local_subnet_without_uid_is_one_device(self):
+        """同网段的同名无 uid 设备仍按名字归并：多网卡/换 IP 的老设备是一台。"""
+        first, second = '192.168.1.5', '192.168.1.6'
+        self.w.online = {first: {'name': '2号机', 'online': True},
+                         second: {'name': '2号机', 'online': True}}
+        self.w.known = {first: {'name': '2号机'}, second: {'name': '2号机'}}
+        self.w.current_ip = None
+        self.assertEqual(self.w._device_key(first), self.w._device_key(second))
+        self.assertEqual(self.w._device_scope(first)[0], {first, second})
+
+    def test_device_with_uid_still_merges_across_subnets(self):
+        """收紧只针对没有 uid 的对端：带 uid 的设备跨网段照样是一台。"""
+        near, far = '192.168.1.5', '10.0.0.5'
+        self.w.online = {near: {'name': '笔记本', 'uid': 'lap', 'online': True},
+                         far: {'name': '笔记本', 'uid': 'lap', 'online': True}}
+        self.w.known = {near: {'name': '笔记本', 'uid': 'lap'},
+                        far: {'name': '笔记本', 'uid': 'lap'}}
+        self.w.current_ip = None
+        self.assertEqual(self.w._device_key(near), self.w._device_key(far))
+        self.assertEqual(self.w._device_scope(far)[0], {near, far})
+        self.w._rebuild_peer_list()
+        self.assertEqual(list(self.w._peer_list_state), [near])   # 列表里只有一项
+        # 换到跨网段的 IP 上说话，记录仍落进同一个聊天
+        self.w._on_chat_in('笔记本', near, 'text', '同网段发的')
+        self.w._on_chat_in('笔记本', far, 'text', '跨网段发的')
+        ips, devs = self.w._device_scope(far)
+        self.assertEqual(self.w.history.page(ips, devs=devs)[0], 2)
+
     def test_delete_device_keeps_records_of_the_device_that_reused_the_ip(self):
         ip = self.w.current_ip
         self.w.online = {ip: {'name': 'Peer', 'uid': 'peer', 'online': True}}
