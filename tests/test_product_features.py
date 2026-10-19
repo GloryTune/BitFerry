@@ -76,6 +76,55 @@ class ProductTests(unittest.TestCase):
             self.w._flush_offline_queue(ip)
             self.assertEqual(send.call_args.kwargs['target_ip'], '192.168.1.9')
 
+    def test_receiving_row_says_which_machine_sent_it(self):
+        """传输队列是全局的，接收行必须写清楚是哪台机器发来的。"""
+        meta = json.dumps([{'name': '报告.zip', 'size': 10}])
+        self.w._on_recv_started('r1', '2号机', '192.168.1.2', meta)
+        row = self.w.transfer_queue._rows['r1']
+        self.assertEqual(row.name_lbl.text(), '正在接收 · 来自 2号机: 报告.zip')
+        self.w._on_recv_done('r1')
+        # 没收到开始事件时(直接来的进度), 也要带上记下来的发送方
+        self.w._recv_meta['r2'] = {'ip': '192.168.1.2', 'label': '报告.zip', 'peer': '2号机'}
+        self.w._on_recv_progress('r2', '报告.zip', 1, 10, 0)
+        self.assertIn('来自 2号机', self.w.transfer_queue._rows['r2'].name_lbl.text())
+        self.assertEqual(app.TransferRow('s1', '报告.zip', 'send').name_lbl.text(), '正在发送: 报告.zip')
+
+    def test_history_dialog_opens_at_the_newest_message(self):
+        store = self.w.history
+        for i in range(120):
+            store.append(self.w.current_ip, {'kind': 'text', 'payload': f'历史 {i}', 'mine': True,
+                'ts': '12:00', 'name': 'Me', 'seq': i, 'day': '2026-09-11'})
+        store.save()
+        dlg = app.HistoryDialog(self.w, 'Peer', [], store=store, ips=[self.w.current_ip])
+        dlg.resize(400, 300)
+        dlg.show()
+        try:
+            self.pump(lambda: '120' in dlg.page_label.text())
+            self.qt.processEvents()
+            self.assertIn('第 3 / 3 页', dlg.page_label.text())     # 最后一页
+            bar = dlg.scroll.verticalScrollBar()
+            self.pump(lambda: bar.value() == bar.maximum())
+            self.assertFalse(dlg._open_at_latest)
+        finally:
+            dlg.close()
+
+    def test_screenshot_is_copied_to_clipboard(self):
+        path = self.make_image()
+        self.qt.clipboard().clear()
+        self.w._stage_screenshot(str(path))
+        self.assertEqual(self.qt.clipboard().pixmap().size(), app.QPixmap(str(path)).size())
+
+    def test_preview_scales_to_device_pixels_on_high_dpi(self):
+        wide = app.QPixmap(1000, 500)
+        with patch.object(app, '_preview_dpr', return_value=2.0):
+            preview = app._preview_pixmap(wide, 320)
+            self.assertEqual((preview.width(), preview.devicePixelRatio()), (640, 2.0))
+            narrow = app.QPixmap(200, 100)                 # 原图不够宽就别放大
+            self.assertEqual(app._preview_pixmap(narrow, 320).width(), 200)
+            image = app._preview_image(wide.toImage(), 160)
+            self.assertEqual((image.width(), image.devicePixelRatio()), (320, 2.0))
+        self.assertEqual(app._preview_pixmap(wide, 320).devicePixelRatio(), 1.0)
+
     def test_new_device_on_reused_ip_does_not_inherit_old_chat(self):
         """DHCP 把旧设备的 IP 分给新机器后，旧设备的聊天不能出现在新机器的会话里。"""
         ip = self.w.current_ip

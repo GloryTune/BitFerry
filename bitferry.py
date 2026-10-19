@@ -4571,6 +4571,37 @@ def _open_path(path):
         pass
 
 
+def _preview_dpr():
+    """屏幕缩放比例。Windows 上 125%/150% 很常见，预览图必须按它出设备像素。"""
+    try:
+        screen = QGuiApplication.primaryScreen()
+        return min(3.0, max(1.0, screen.devicePixelRatio() or 1.0)) if screen else 1.0
+    except Exception:
+        return 1.0
+
+
+def _preview_pixmap(pix, logical_w):
+    """把图缩到 logical_w 个逻辑像素宽，但实际出 logical_w×dpr 个设备像素并标上
+    dpr：只按逻辑宽度缩的话，高 DPI 屏上会被系统再放大一次，看着就糊了。
+    原图本来就比 logical_w 窄时按原样显示，不做放大。"""
+    if pix.isNull() or pix.width() <= logical_w or logical_w <= 0:
+        return pix
+    target = min(int(round(logical_w * _preview_dpr())), pix.width())
+    out = pix.scaledToWidth(target, Qt.TransformationMode.SmoothTransformation)
+    out.setDevicePixelRatio(target / logical_w)
+    return out
+
+
+def _preview_image(img, logical_w):
+    """_preview_pixmap 的 QImage 版本，供输入框里的缩略图用。"""
+    if img.isNull() or img.width() <= logical_w or logical_w <= 0:
+        return img
+    target = min(int(round(logical_w * _preview_dpr())), img.width())
+    out = img.scaledToWidth(target, Qt.TransformationMode.SmoothTransformation)
+    out.setDevicePixelRatio(target / logical_w)
+    return out
+
+
 class ClickableImage(QLabel):
     # 全局注册表: 发送方图片进度动画
     _registry: list = []
@@ -5147,9 +5178,7 @@ class Bubble(QFrame):
             path = part.get("path", "")
             pix = QPixmap(path)
             if not pix.isNull():
-                if pix.width() > 320:
-                    pix = pix.scaledToWidth(320, Qt.TransformationMode.SmoothTransformation)
-                bl.addWidget(ClickableImage(path, pix))
+                bl.addWidget(ClickableImage(path, _preview_pixmap(pix, 320)))
             else:
                 bl.addWidget(QLabel("[图片无法显示]"))
         elif t == "file":
@@ -5220,6 +5249,7 @@ class HistoryDialog(QDialog):
     def __init__(self, parent, peer_name, msgs, on_retry=None, store=None, ips=None, devs=None):
         super().__init__(parent)
         self._store, self._ips, self._devs = store, tuple(ips or []), tuple(devs or [])
+        self._open_at_latest = True      # 首次渲染后滚到底部，直接看到最近的消息
         self._closed = False
         self._query_cancel = threading.Event()
         self._page = 0
@@ -5359,6 +5389,15 @@ class HistoryDialog(QDialog):
             self._matches = self._messages
             self._show_page(self._messages.index(record) // self.PAGE_SIZE)
 
+    def _scroll_to_latest(self):
+        if self._closed:
+            return
+        try:
+            bar = self.scroll.verticalScrollBar()
+            bar.setValue(bar.maximum())
+        except RuntimeError:       # 弹窗已销毁
+            pass
+
     def _render_page(self, page, total, records):
         pages = max(1, (total + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
         self._page = page
@@ -5390,6 +5429,10 @@ class HistoryDialog(QDialog):
         if old:
             old.deleteLater()
         self.scroll.setWidget(canvas)
+        if self._open_at_latest:
+            # 打开弹窗默认停在最新一条(最后一页的底部), 而不是这一页的开头
+            self._open_at_latest = False
+            QTimer.singleShot(0, self._scroll_to_latest)
         self.page_label.setText(f"第 {self._page + 1} / {pages} 页 · {total} 条")
         self.previous.setEnabled(self._page > 0)
         self.next.setEnabled(self._page + 1 < pages)
@@ -6032,7 +6075,7 @@ class TransferRow(QFrame):
     """传输队列里的一行: 方向图标 + 名称 + 进度条 + 速度 (+ 发送时的暂停/取消)。
     direction: send/recv; controllable=True 时显示暂停/取消(仅发送)。"""
     def __init__(self, unit_id, label, direction="send", controllable=True,
-                 on_pause=None, on_cancel=None, parent=None):
+                 on_pause=None, on_cancel=None, parent=None, peer=None):
         super().__init__(parent)
         self.unit_id = unit_id
         self.paused = False
@@ -6049,10 +6092,13 @@ class TransferRow(QFrame):
 
         col = QVBoxLayout()
         col.setSpacing(2)
+        # 接收时标明是哪台机器发来的: 队列是全局的, 不写清楚就分不出来源
+        who = f" · 来自 {peer[:12]}" if (direction == "recv" and peer) else ""
+        verb = ("正在发送" if direction == "send" else "正在接收") + who + ": "
+        budget = max(12, 34 - len(who))
         name = Path(label).name if label else label
-        if len(name) > 34:
-            name = name[:31] + "…"
-        verb = "正在发送: " if direction == "send" else "正在接收: "
+        if len(name) > budget:
+            name = name[:budget - 3] + "…"
         self.name_lbl = QLabel(verb + name)
         self.name_lbl.setObjectName("xferName")
         col.addWidget(self.name_lbl)
@@ -6125,10 +6171,10 @@ class TransferQueueWidget(QFrame):
         self.hide()
 
     def add_unit(self, unit_id, label, direction="send", controllable=True,
-                 on_pause=None, on_cancel=None):
+                 on_pause=None, on_cancel=None, peer=None):
         if unit_id in self._rows:
             return
-        row = TransferRow(unit_id, label, direction, controllable, on_pause, on_cancel)
+        row = TransferRow(unit_id, label, direction, controllable, on_pause, on_cancel, peer=peer)
         self._rows[unit_id] = row
         self._lay.addWidget(row)
         self.show()
@@ -6467,7 +6513,7 @@ class ChatInput(QTextEdit):
         disp_h = int(img.height() * ratio)
         self._img_counter += 1
         res_name = f"lt_img_{self._img_counter}"
-        thumb = img.scaledToWidth(disp_w, Qt.TransformationMode.SmoothTransformation)
+        thumb = _preview_image(img, disp_w)
         self.document().addResource(3, QUrl(res_name), thumb)  # 3 = ImageResource
         self._img_map[res_name] = path
         fmt = QTextImageFormat()
@@ -6529,7 +6575,7 @@ class ChatInput(QTextEdit):
         for name, path in self._img_map.items():
             img = QImage(path)
             if not img.isNull():
-                self.document().addResource(3, QUrl(name), img.scaledToWidth(min(160, img.width())))
+                self.document().addResource(3, QUrl(name), _preview_image(img, min(160, img.width())))
         missing = [path for path in self._img_map.values() if not Path(path).is_file()]
         self.setToolTip("草稿图片已失效，请重新添加：" + "、".join(missing) if missing else "")
         cur = self.textCursor()
@@ -6579,7 +6625,7 @@ class ChatInput(QTextEdit):
         disp_w = min(160, img.width())
         ratio = disp_w / img.width() if img.width() else 1
         disp_h = int(img.height() * ratio)
-        thumb = img.scaledToWidth(disp_w, Qt.TransformationMode.SmoothTransformation)
+        thumb = _preview_image(img, disp_w)
         self.document().addResource(3, QUrl(name), thumb)
         self._img_map[name] = newpath
         doc = self.document()
@@ -8958,10 +9004,10 @@ class MainWindow(QMainWindow):
     def _on_recv_progress(self, recv_id, filename, done, total, speed):
         # 统一: 接收进度只在顶部队列显示(无饼状)
         if not self.transfer_queue.has(recv_id):
-            label = self._recv_meta.get(recv_id, {}).get("label") or (
-                Path(filename).name if filename else "文件")
+            meta = self._recv_meta.get(recv_id, {})
+            label = meta.get("label") or (Path(filename).name if filename else "文件")
             self.transfer_queue.add_unit(recv_id, label, direction="recv",
-                                         controllable=False)
+                                         controllable=False, peer=meta.get("peer"))
         self.transfer_queue.update_unit(recv_id, done, total, speed)
 
     def _on_recv_done(self, recv_id):
@@ -8998,9 +9044,9 @@ class MainWindow(QMainWindow):
             label = f"{names[0]} 等 {len(names)} 个文件"
         else:
             label = "文件"
-        self._recv_meta[recv_id] = {"ip": sender_ip, "label": label}
+        self._recv_meta[recv_id] = {"ip": sender_ip, "label": label, "peer": sender_name}
         self.transfer_queue.add_unit(recv_id, label, direction="recv",
-                                     controllable=False)
+                                     controllable=False, peer=sender_name)
 
     # ---------- 离线队列 ----------
     def _finish_offline_component(self, ip, queue_id, component, status):
@@ -9566,6 +9612,7 @@ class MainWindow(QMainWindow):
                 else:
                     self.showNormal()
             return
+        self._copy_shot_to_clipboard(path)
         self.input.add_inline_image(path, at_end=True)
         if load_focus_after_shot():
             self._bring_to_front()
@@ -9629,8 +9676,19 @@ class MainWindow(QMainWindow):
             self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized)
             self.show()
 
+    def _copy_shot_to_clipboard(self, path):
+        """截完图顺手放一份到剪贴板，方便直接粘到别的软件里。"""
+        try:
+            pix = QPixmap(path)
+            if not pix.isNull():
+                QGuiApplication.clipboard().setPixmap(pix)
+                self._append_log("截图已复制到剪贴板", "info")
+        except Exception as e:
+            self._append_log(f"截图复制到剪贴板失败：{e}", "warn")
+
     def _stage_screenshot(self, path):
         # 截图完成回主线程 -> 内嵌输入框
+        self._copy_shot_to_clipboard(path)
         self.input.add_inline_image(path, at_end=True)
         if load_focus_after_shot():
             self._bring_to_front()
