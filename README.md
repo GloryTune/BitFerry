@@ -10,7 +10,7 @@
 
 | 平台 | 下载 |
 |------|------|
-| **Windows 10/11 x64** | [BitFerry-windows-x64.exe](https://github.com/GloryTune/BitFerry/releases/download/v2.02/BitFerry-windows-x64.exe) |
+| **Windows 10/11 x64** | [BitFerry-windows-x64.exe](https://github.com/GloryTune/BitFerry/releases/latest/download/BitFerry-windows-x64.exe) |
 | **macOS (Apple Silicon)** | [BitFerry-macos-arm64.zip](https://github.com/GloryTune/BitFerry/releases/latest/download/BitFerry-macos-arm64.zip) |
 
 > **macOS 提示**：解压后将 `BitFerry.app` 拖入应用程序文件夹。首次打开若提示"无法验证开发者"，前往 **系统设置 → 隐私与安全性** 点击「仍要打开」。
@@ -340,6 +340,5 @@ MIT License
 
 ### 发布 2.03
 
-本次提供 macOS Apple Silicon 独立应用，版本号为 `2.03`，发布标签为 `v2.03`。
-Windows 预编译包仍为 `v2.02`；最新 Windows 源码可按上方步骤自行构建。
-`version.json` 仅列出本次实际发布的 macOS 资产。
+本次同时提供 macOS Apple Silicon 与 Windows x64 独立应用，版本号为 `2.03`，发布标签为 `v2.03`。
+`version.json` 列出两个平台的资产，应用内更新检查据此拼出下载直链。

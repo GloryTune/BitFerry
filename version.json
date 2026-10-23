@@ -1,7 +1,8 @@
 {
   "version": "2.03",
-  "notes": "## 2.03 更新\n\n- 「回到最新」改成浮在消息区右下角的胶囊按钮（向下双箭头），只在明显往上翻时出现，不再占着标题栏。\n- 从 Dock / 任务栏右键退出时，不再误报「已最小化到托盘」；这类退出现在会正常落盘并停掉后台服务。\n- 删除设备前会先确认，并写明会连带删掉多少条聊天记录。\n\n本次提供 macOS Apple Silicon 独立应用，无需安装 Python。Windows 用户可继续使用 v2.02，或使用最新源码自行构建。\n",
+  "notes": "## 2.03 更新\n\n- 「回到最新」改成浮在消息区右下角的胶囊按钮（向下双箭头），只在明显往上翻时出现，不再占着标题栏。\n- 从 Dock / 任务栏右键退出时，不再误报「已最小化到托盘」；这类退出现在会正常落盘并停掉后台服务。\n- 删除设备前会先确认，并写明会连带删掉多少条聊天记录。\n\n本次提供 macOS Apple Silicon 与 Windows x64 独立应用，无需安装 Python。\n",
   "assets": {
-    "darwin": "BitFerry-macos-arm64.zip"
+    "darwin": "BitFerry-macos-arm64.zip",
+    "windows": "BitFerry-windows-x64.exe"
   }
 }
