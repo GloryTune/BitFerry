@@ -212,7 +212,11 @@ class ProductTests(unittest.TestCase):
         self.w._on_chat_in('Peer', ip, 'text', '旧机器')
         self.w._on_peers_change({ip: {'name': 'Newbie', 'uid': 'newbie', 'online': True}})
         self.w._on_chat_in('Newbie', ip, 'text', '新机器')
-        self.w._delete_peer(ip)                           # 删掉新机器
+        box = Mock(); confirm = object()
+        box.addButton.side_effect = [confirm, object()]
+        box.clickedButton.return_value = confirm
+        with patch.object(app, 'QMessageBox', return_value=box):
+            self.w._delete_peer(ip)                       # 删掉新机器
         self.w.known['192.168.1.9'] = {'name': 'Peer', 'uid': 'peer'}
         ips, devs = self.w._device_scope('192.168.1.9')
         total, _, records = self.w.history.page(ips, devs=devs)
@@ -326,6 +330,26 @@ class ProductTests(unittest.TestCase):
         with patch.object(app.QMessageBox, 'warning') as warning:
             self.assertFalse(self.w._retry_queue_component(ip, qid, uid))
             warning.assert_called_once()
+
+    def test_delete_device_says_how_many_records_go_and_cancel_keeps_them(self):
+        ip = self.w.current_ip
+        self.w._on_chat_in('Peer', ip, 'text', '一')
+        self.w._on_chat_in('Peer', ip, 'text', '二')
+        ips, devs = self.w._device_scope(ip)
+        box = Mock(); confirm, cancel = object(), object()
+        box.addButton.side_effect = [confirm, cancel]
+        box.clickedButton.return_value = cancel
+        with patch.object(app, 'QMessageBox', return_value=box):
+            self.w._delete_peer(ip)
+        self.assertIn('2 条聊天记录', box.setInformativeText.call_args[0][0])
+        self.assertIn(ip, self.w.known)                   # 取消了就什么都别动
+        self.assertEqual(self.w.history.count(ips, devs), 2)
+        box.addButton.side_effect = [confirm, cancel]
+        box.clickedButton.return_value = confirm
+        with patch.object(app, 'QMessageBox', return_value=box):
+            self.w._delete_peer(ip)
+        self.assertNotIn(ip, self.w.known)
+        self.assertEqual(self.w.history.count(ips, devs), 0)
 
     def test_delete_device_can_cancel_or_keep_tasks_and_handles_save_failure(self):
         ip = self.w.current_ip

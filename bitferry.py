@@ -38,6 +38,7 @@ from datetime import datetime
 from PyQt6.QtCore import (
     Qt, QObject, pyqtSignal, QSize, QBuffer, QByteArray, QTimer, QUrl,
     QRectF, QRect, QPoint, QPointF, QAbstractNativeEventFilter, QLockFile, QLocale,
+    QEvent,
 )
 from PyQt6.QtGui import (
     QFont, QPixmap, QImage, QKeySequence, QShortcut, QTextCursor, QGuiApplication,
@@ -67,7 +68,7 @@ TRANSFER_PORT = 50809
 
 # ---------- 版本 / 在线更新 ----------
 # 发版时同步修改此处与 bitferry.spec 里的 CFBundleShortVersionString。
-__version__ = "2.02"
+__version__ = "2.03"
 GITHUB_REPO = "GloryTune/BitFerry"
 GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases/latest"
 # 检查更新走仓库里的 version.json(经 raw CDN, 不受 api.github.com 60次/小时限流);
@@ -6921,6 +6922,77 @@ def _scan_folder(path, progress, cancelled):
     return items, total
 
 
+class JumpLatestButton(QPushButton):
+    """浮在消息区右下角的“回到最新”胶囊钮：一对向下的箭头，和 QQ 等聊天软件一致。"""
+
+    W, H = 56, 32
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(self.W, self.H)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("回到最新消息")
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.hide()
+
+    def attach(self, viewport):
+        """贴到滚动区的 viewport 上：不占布局，所以显隐不会挤动消息。"""
+        self.setParent(viewport)
+        viewport.installEventFilter(self)
+        self._reposition()
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.Resize:
+            self._reposition()
+        return False
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self._reposition()
+
+    def enterEvent(self, e):
+        super().enterEvent(e)
+        self.update()
+
+    def leaveEvent(self, e):
+        super().leaveEvent(e)
+        self.update()
+
+    def _reposition(self):
+        host = self.parentWidget()
+        if host:
+            self.move(host.width() - self.width() - 14,
+                      host.height() - self.height() - 12)
+            self.raise_()
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        lit = self.underMouse()
+        pill = QRectF(2.0, 1.0, self.width() - 4.0, self.height() - 5.0)
+        r = pill.height() / 2
+        # 柔和投影，让胶囊浮在气泡之上
+        p.setPen(Qt.PenStyle.NoPen)
+        for i, alpha in enumerate((18, 30)):
+            p.setBrush(QColor(0, 0, 0, alpha))
+            p.drawRoundedRect(pill.translated(0, 2.5 - i), r, r)
+        # 用气泡的底色：在每套主题里都像一张浮起来的小卡片
+        p.setBrush(QColor(_theme_color("bubble_theirs")))
+        p.setPen(QPen(QColor(_theme_color("panel_border")), 1))
+        p.drawRoundedRect(pill, r, r)
+        # 两个叠起来的向下箭头
+        cx, cy = pill.center().x(), pill.center().y()
+        pen = QPen(_theme_accent(255 if lit else 225), 2.0)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        for dy in (-4.0, 1.0):
+            p.drawPolyline(QPolygonF([QPointF(cx - 5.0, cy + dy),
+                                      QPointF(cx, cy + dy + 4.0),
+                                      QPointF(cx + 5.0, cy + dy)]))
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -7025,6 +7097,10 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(STYLE)
         self._force_quit = False
         self._tray_notified = False
+        self._shutdown_done = False
+        # Dock / ⌘Q / 系统注销发来的退出，会先给窗口一个关闭事件、再结束应用；
+        # 窗口那边把关闭拦成“最小化到托盘”也拦不住退出，所以在这里补上收尾。
+        QApplication.instance().aboutToQuit.connect(self._on_app_quit)
         self._build_tray()
         self._shot_shortcut = None
         self._global_hotkey = None
@@ -7676,14 +7752,10 @@ class MainWindow(QMainWindow):
         browse = QHBoxLayout()
         self._older_messages = QPushButton("加载更早消息")
         self._older_messages.clicked.connect(self._load_older_session)
-        self.btn_latest = QPushButton("回到最新")
-        self.btn_latest.setObjectName("miniBtn")
-        self.btn_latest.setMinimumWidth(80)
-        self.btn_latest.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_latest = JumpLatestButton()
         self.btn_latest.clicked.connect(lambda: self._render_session(self.current_ip))
-        self.btn_latest.hide()
-        # 放在固定高度的会话标题栏，显隐时不会挤动消息或改变滚动位置。
-        hl.addWidget(self.btn_latest)
+        # 浮在消息区右下角，不进布局：显隐时不会挤动消息或改变滚动位置。
+        self.btn_latest.attach(self.chat_scroll.viewport())
         browse.addWidget(self._older_messages)
         browse.addStretch()
         cl.addLayout(browse)
@@ -7838,32 +7910,62 @@ class MainWindow(QMainWindow):
         if chosen == act_del:
             self._delete_peer(ip)
 
+    def _stored_message_count(self, ips, devs):
+        """该设备在历史库里的记录条数；数不出来时返回 None，由调用方含糊其辞。"""
+        try:
+            if isinstance(self.history, HistoryStore):
+                return self.history.count(ips, devs)
+            return sum(1 for addr, records in self.history.items()
+                       for m in records if belongs_to_device(m, addr, devs, ips))
+        except Exception as exc:
+            _log_persist_error("统计聊天记录条数", exc)
+            return None
+
     def _delete_peer(self, ip):
         identity = self._device_key(ip)
         aliases, devs = self._device_scope(ip)
         tasks = [(addr, e) for addr, entries in self.offline_queue.items() for e in entries
                  if e.get("recipient") == identity or (not e.get("recipient") and addr in aliases)]
+        if tasks and any(addr == a and qid == e.get("msg_id") for a, e in tasks
+                         for addr, qid, component in self._offline_inflight):
+            QMessageBox.information(self, "设备仍有传输", "请先在发送队列中停止传输，再删除设备。")
+            return
+        # 删设备会连同聊天记录一起删掉且无法恢复，先把代价说清楚再问。
+        stored = self._stored_message_count(aliases, devs)
+        box = QMessageBox(self)
+        box.setWindowTitle("删除设备")
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setText(f"删除「{self._peer_name(ip)}」？")
+        lines = []
         if tasks:
-            if any(addr == a and qid == e.get("msg_id") for a, e in tasks
-                   for addr, qid, component in self._offline_inflight):
-                QMessageBox.information(self, "设备仍有传输", "请先在发送队列中停止传输，再删除设备。")
+            lines.append(f"该设备还有 {len(tasks)} 个待发任务。")
+        if stored:
+            lines.append(f"与它的 {stored} 条聊天记录会一并删除，无法恢复。")
+            lines.append("记录里的图片会在下次清理存储时一并回收。")
+        elif stored == 0:
+            lines.append("该设备没有聊天记录。")
+        else:
+            lines.append("与它的全部聊天记录会一并删除，无法恢复。")
+        box.setInformativeText("\n".join(lines))
+        if tasks:
+            discard = box.addButton("删除并撤销任务", QMessageBox.ButtonRole.DestructiveRole)
+            box.addButton("删除并保留任务", QMessageBox.ButtonRole.ActionRole)
+        else:
+            discard = None
+            box.addButton("删除", QMessageBox.ButtonRole.DestructiveRole)
+        cancel = box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(cancel)          # 默认停在取消上，回车不会误删
+        box.exec()
+        chosen = box.clickedButton()
+        if chosen is None or chosen is cancel:
+            return
+        if chosen is discard:
+            replacement = {addr: [e for e in entries if (addr, e) not in tasks]
+                           for addr, entries in self.offline_queue.items()}
+            if not save_offline_queue(replacement):
+                QMessageBox.warning(self, "删除未完成", "撤销任务未能保存，设备和任务均已保留。")
                 return
-            box = QMessageBox(self)
-            box.setWindowTitle("删除设备")
-            box.setText(f"该设备还有 {len(tasks)} 个待发任务。删除设备时如何处理？")
-            discard = box.addButton("同时撤销任务", QMessageBox.ButtonRole.DestructiveRole)
-            keep = box.addButton("保留任务", QMessageBox.ButtonRole.ActionRole)
-            box.addButton(QMessageBox.StandardButton.Cancel)
-            box.exec()
-            if box.clickedButton() not in (discard, keep):
-                return
-            if box.clickedButton() == discard:
-                replacement = {addr: [e for e in entries if (addr, e) not in tasks]
-                               for addr, entries in self.offline_queue.items()}
-                if not save_offline_queue(replacement):
-                    QMessageBox.warning(self, "删除未完成", "撤销任务未能保存，设备和任务均已保留。")
-                    return
-                self.offline_queue = replacement
+            self.offline_queue = replacement
         for addr in aliases:
             if addr.startswith("web:") and hasattr(self, "webbridge"):
                 self.webbridge.forget(addr)
@@ -8197,7 +8299,9 @@ class MainWindow(QMainWindow):
         total = self._session_count(self.current_ip) if self.current_ip else 0
         bar = self.chat_scroll.verticalScrollBar()
         older_page = getattr(self, "_session_end", total) < total
-        self.btn_latest.setVisible(bool(total) and (older_page or bar.value() < bar.maximum()))
+        # 只有明显离开底部时才浮出来，轻轻一滚不打扰。
+        away = bar.maximum() - bar.value() > 160
+        self.btn_latest.setVisible(bool(total) and (older_page or away))
 
     def _load_older_session(self):
         if self.current_ip and getattr(self, "_session_start", 0) > 0:
@@ -9827,44 +9931,31 @@ class MainWindow(QMainWindow):
             self.webbridge.start()
         self._append_log("已取消等待退出", "info")
 
-    def closeEvent(self, event):
-        # 记住窗口大小/位置(无论最小化到托盘还是真正退出都记一次)
-        if load_remember_window():
-            try:
-                geom = bytes(self.saveGeometry().toBase64()).decode("ascii")
-                set_setting("window_geom", geom)
-            except Exception:
-                pass
-        # 关闭 = 最小化到托盘(而非退出)
-        if (not self._force_quit and load_close_to_tray()
-                and getattr(self, "tray", None) is not None):
-            event.ignore()
-            self.hide()
-            if not self._tray_notified:
-                self._tray_notified = True
-                try:
-                    self.tray.showMessage(
-                        "BitFerry 仍在后台运行",
-                        "已最小化到托盘，可从托盘图标打开或退出。",
-                        QSystemTrayIcon.MessageIcon.Information, 3000)
-                except Exception:
-                    pass
+    def _on_app_quit(self):
+        """应用层面的退出请求：这是真的要退出，不是“最小化到托盘”。"""
+        self._force_quit = True
+        self._notify_tray_pending = False      # 掐掉还没弹出去的“已最小化”气泡
+        self._shutdown()
+
+    def _notify_minimized_to_tray(self):
+        if not getattr(self, "_notify_tray_pending", False) or self._force_quit:
             return
-        if self._transfers_busy():
-            event.ignore()
-            if self._waiting_exit:
-                return
-            answer = QMessageBox.question(self, "仍有传输或后台任务", "是否在所有传输和后台任务完成后自动退出？暂停的发送任务需要先恢复或撤销。")
-            if answer == QMessageBox.StandardButton.Yes:
-                self._waiting_exit = True
-                self.receiver.stop()
-                self._web_was_running = self.webbridge.running()
-                self.webbridge.stop()
-                self.btn_cancel_exit.show()
-                self._append_log("用户选择传输完成后退出，暂停新接收和新发送", "info")
-                QTimer.singleShot(300, self._wait_for_exit)
+        self._notify_tray_pending = False
+        if getattr(self, "tray", None) is None:
             return
-        # 真正退出: 清理资源
+        try:
+            self.tray.showMessage(
+                "BitFerry 仍在后台运行",
+                "已最小化到托盘，可从托盘图标打开或退出。",
+                QSystemTrayIcon.MessageIcon.Information, 3000)
+        except Exception:
+            pass
+
+    def _shutdown(self):
+        """落盘并停掉后台服务。关窗退出和应用退出都会走到这里，只执行一次。"""
+        if self._shutdown_done:
+            return
+        self._shutdown_done = True
         self._draft_timer.stop()
         self._save_drafts()
         self._save_staged_receives()
@@ -9883,6 +9974,42 @@ class MainWindow(QMainWindow):
             self._mac_hotkey.unregister()
         if getattr(self, "tray", None) is not None:
             self.tray.hide()
+
+    def closeEvent(self, event):
+        # 记住窗口大小/位置(无论最小化到托盘还是真正退出都记一次)
+        if load_remember_window():
+            try:
+                geom = bytes(self.saveGeometry().toBase64()).decode("ascii")
+                set_setting("window_geom", geom)
+            except Exception:
+                pass
+        # 关闭 = 最小化到托盘(而非退出)
+        if (not self._force_quit and load_close_to_tray()
+                and getattr(self, "tray", None) is not None):
+            event.ignore()
+            self.hide()
+            if not self._tray_notified:
+                self._tray_notified = True
+                # 气泡延后一拍再弹: Dock/⌘Q/注销的退出请求紧跟在这个关闭事件后面
+                # 到达，那一拍根本不会到来，也就不会在真退出时谎称“还在后台”。
+                self._notify_tray_pending = True
+                QTimer.singleShot(0, self._notify_minimized_to_tray)
+            return
+        if self._transfers_busy():
+            event.ignore()
+            if self._waiting_exit:
+                return
+            answer = QMessageBox.question(self, "仍有传输或后台任务", "是否在所有传输和后台任务完成后自动退出？暂停的发送任务需要先恢复或撤销。")
+            if answer == QMessageBox.StandardButton.Yes:
+                self._waiting_exit = True
+                self.receiver.stop()
+                self._web_was_running = self.webbridge.running()
+                self.webbridge.stop()
+                self.btn_cancel_exit.show()
+                self._append_log("用户选择传输完成后退出，暂停新接收和新发送", "info")
+                QTimer.singleShot(300, self._wait_for_exit)
+            return
+        self._shutdown()
         event.accept()
 
 

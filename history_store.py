@@ -195,6 +195,12 @@ class HistoryStore(MutableMapping):
                 self._cache.pop(rid)
                 self._saved.pop(rid, None)
 
+    def count(self, ips, devs=()):
+        """归属该设备的记录条数：库里已落盘的，加上还留在缓存里没落盘的。"""
+        total = self.page(ips, page=0, size=1, devs=devs)[0]
+        return total + sum(1 for rid, (peer, rec) in self._cache.items()
+                           if rid not in self._saved and belongs_to_device(rec, peer, devs, ips))
+
     def __contains__(self, ip):
         if any(peer == ip for peer, rec in self._cache.values()):
             return True
