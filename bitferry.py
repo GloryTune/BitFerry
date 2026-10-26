@@ -38,12 +38,12 @@ from datetime import datetime
 from PyQt6.QtCore import (
     Qt, QObject, pyqtSignal, QSize, QBuffer, QByteArray, QTimer, QUrl,
     QRectF, QRect, QPoint, QPointF, QAbstractNativeEventFilter, QLockFile, QLocale,
-    QEvent,
+    QEvent, QMimeData, QPropertyAnimation, QEasingCurve,
 )
 from PyQt6.QtGui import (
     QFont, QPixmap, QImage, QKeySequence, QShortcut, QTextCursor, QGuiApplication,
     QIcon, QAction, QPainter, QColor, QPen, QPainterPath, QFontMetrics, QPolygonF,
-    QCursor, QTransform,
+    QCursor, QTransform, QDrag,
 )
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QMainWindow, QLabel, QPushButton, QListWidget,
@@ -52,6 +52,7 @@ from PyQt6.QtWidgets import (
     QStackedWidget, QSpacerItem, QSystemTrayIcon, QMenu, QDialog, QLineEdit,
     QProgressBar, QRadioButton, QButtonGroup, QToolButton, QCheckBox,
     QTableWidget, QTableWidgetItem, QHeaderView, QComboBox, QStyle,
+    QAbstractItemView,
 )
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 
@@ -588,6 +589,7 @@ _STYLE_TPL = (
     "#peerNameOff {{ color:{t2}; font-size:13px; font-weight:600; }}\n"
     "#peerIp {{ color:{t2}; font-size:11px; }}\n"
     "#peerIpOff {{ color:{t3}; font-size:11px; }}\n"
+    "#peerPin {{ color:{accent}; font-size:11px; }}\n"
     "#dotOn {{ color:{online}; font-size:13px; }}\n"
     "#dotOff {{ color:{offline}; font-size:13px; }}\n"
     "#chatHeader {{ background:{panel_bg}; border-bottom:1px solid {panel_border}; }}\n"
@@ -6858,7 +6860,7 @@ class WebAccessDialog(QDialog):
 
 # ----------------------------- 设备项控件 -----------------------------
 class PeerItem(QWidget):
-    def __init__(self, name, ip, online, unread=0, queued=0):
+    def __init__(self, name, ip, online, unread=0, queued=0, pinned=False):
         super().__init__()
         lay = QHBoxLayout(self)
         lay.setContentsMargins(14, 10, 14, 10)
@@ -6882,6 +6884,11 @@ class PeerItem(QWidget):
         text.addWidget(ipl)
         lay.addLayout(text)
         lay.addStretch()
+        if pinned:
+            pin = QLabel("📌")
+            pin.setObjectName("peerPin")
+            pin.setToolTip("已置顶")
+            lay.addWidget(pin, 0, Qt.AlignmentFlag.AlignVCenter)
         if queued > 0 and not online:
             ql = QLabel(f"⏳{queued}")
             ql.setObjectName("peerQueued")
@@ -6894,6 +6901,197 @@ class PeerItem(QWidget):
             badge.setFixedHeight(20)
             badge.setMinimumWidth(20)
             lay.addWidget(badge, 0, Qt.AlignmentFlag.AlignVCenter)
+
+
+class PeerListWidget(QListWidget):
+    """设备列表。置顶的几项之间可以拖动调整先后顺序，没置顶的项不参与拖动。
+
+    拖的时候被拖那行先"拎"出来跟着光标走，剩下的几行平滑滑动给它让出一个空位，
+    空位在哪松手就落在哪，不用去猜那根细线指的是哪儿。
+
+    没有直接用 QListWidget 自带的 InternalMove：列表项的内容是 setItemWidget 挂上去
+    的 QWidget，框架搬运行的时候会把这些 widget 丢掉，拖完一行就剩个空条。所以从
+    startDrag 到 dropEvent 全都自己来，只算出置顶项的新顺序发出去，由主窗口存盘后
+    整体重建列表。
+    """
+
+    orderChanged = pyqtSignal(list)        # 拖动后置顶项的新顺序(代表 IP 列表)
+    dragFinished = pyqtSignal()            # 一趟拖动结束(不论顺序有没有变)
+
+    SLIDE_MS = 140                         # 让位动画时长, 再长就显得拖沓
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.setDragDropOverwriteMode(False)
+        self.setDropIndicatorShown(False)  # 空位本身就是指示器, 不用再画那根线
+        self._pinned_rows = 0
+        self._drag_row = None              # 正在拖的行号; None 表示没在拖
+        self._home = []                    # 拖动开始时各置顶行的原始位置
+        self._gap_at = None                # 空位当前开在哪个插入位
+        self._slides = {}                  # 行号 -> 让位动画
+        self._pending_order = None         # 落点算出的新顺序, 等拖动彻底结束再发
+
+    def set_pinned_rows(self, count):
+        """前 count 行是置顶项：只有它们能拖，也只能落在这一段里。"""
+        self._pinned_rows = count
+        self.setDragEnabled(count > 1)     # 只有一项置顶时没什么可排的
+
+    def is_reordering(self):
+        """拖动过程中为真。此时列表不能重建：widget 正被动画挪着，clear() 会把它们
+        连同拖放状态一起销毁。"""
+        return self._drag_row is not None
+
+    # ---------- 拖动 ----------
+    def startDrag(self, supportedActions):
+        """自己起拖，为的是给光标挂上这一行的真实样子。QAbstractItemView 默认的拖拽
+        图是用 delegate 画的，而这里每行的内容都是 setItemWidget 挂的 widget，
+        delegate 什么也没画，拖起来光标底下是一片空白。"""
+        row = self.currentRow()
+        if not (0 <= row < self._pinned_rows):
+            return
+        item = self.item(row)
+        rect = self.visualItemRect(item)
+        drag = QDrag(self)
+        drag.setMimeData(self.model().mimeData([self.indexFromItem(item)]) or QMimeData())
+        # 从 viewport 上原样截这一行：既有 widget 里的名字和圆点，也有 QSS 画的
+        # 圆角底色，比单独 grab 那个 widget(没有底色)像样得多。
+        shot = self.viewport().grab(rect)
+        ghost = QPixmap(shot.size())
+        ghost.setDevicePixelRatio(shot.devicePixelRatio())
+        ghost.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(ghost)
+        painter.setOpacity(0.9)            # 透一点, 看着像被拎起来了
+        painter.drawPixmap(0, 0, shot)
+        painter.end()
+        drag.setPixmap(ghost)
+        drag.setHotSpot(self.viewport().mapFromGlobal(QCursor.pos()) - rect.topLeft())
+        self._begin_reorder(row, rect)
+        try:
+            drag.exec(Qt.DropAction.MoveAction)   # 内部事件循环, 一直转到松手
+        finally:
+            self._finish_drag()
+
+    def _begin_reorder(self, row, rect):
+        self._drag_row = row
+        self._gap_at = None
+        self._home = [self.visualItemRect(self.item(r)) for r in range(self._pinned_rows)]
+        self.setAutoScroll(False)          # 自动滚动会让记下的原始位置全部作废
+        widget = self.itemWidget(self.item(row))
+        if widget:
+            widget.hide()                  # 这一行已经跟着光标走了, 原地留个空
+        self._slide_to(row)                # 先让大家各就各位(此时空位就在原处)
+
+    def _finish_drag(self):
+        """拖动结束的统一出口：停动画、复位、再把算好的新顺序发出去。
+
+        顺序必须等到这里才发：发出去主窗口就会 clear() 重建列表，而在 dropEvent 里
+        Qt 的拖放代码还在栈上拿着这些项。"""
+        for anim in self._slides.values():
+            anim.stop()
+        self._slides.clear()
+        for row in range(min(len(self._home), self.count())):
+            widget = self.itemWidget(self.item(row))
+            if widget:
+                widget.move(self._home[row].topLeft())
+                widget.show()
+        self.setAutoScroll(True)
+        self._drag_row = None
+        self._gap_at = None
+        self._home = []
+        order, self._pending_order = self._pending_order, None
+        if order:
+            self.orderChanged.emit(order)
+        self.dragFinished.emit()
+
+    def _slide_to(self, target):
+        """把空位挪到插入位 target：其余置顶行滑到"抽掉被拖那行、在 target 处插回去"
+        之后各自该在的位置上。"""
+        src = self._drag_row
+        if src is None or target == self._gap_at:
+            return
+        self._gap_at = target
+        # target 是抽走源行之前的插入位, 换算成抽走之后的
+        at = target - 1 if target > src else target
+        for row in range(len(self._home)):
+            if row == src:
+                continue
+            shifted = row - 1 if row > src else row       # 源行抽走后它排第几
+            final = shifted + 1 if shifted >= at else shifted
+            self._slide(row, self._home[final].topLeft())
+
+    def _slide(self, row, point):
+        widget = self.itemWidget(self.item(row))
+        if not widget or widget.pos() == point:
+            return
+        anim = self._slides.get(row)
+        if anim is None:
+            anim = QPropertyAnimation(widget, b"pos", self)
+            anim.setDuration(self.SLIDE_MS)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            self._slides[row] = anim
+        anim.stop()
+        anim.setStartValue(widget.pos())
+        anim.setEndValue(point)
+        anim.start()
+
+    # ---------- 放下 ----------
+    def _from_pinned(self, event):
+        """这趟拖放是不是本列表里某个置顶项发起的。外来的拖放一律不接。"""
+        row = self.currentRow()
+        return (self.is_reordering() and event.source() is self
+                and 0 <= row < self._pinned_rows)
+
+    def _insert_at(self, event):
+        """把落点换算成插入位置(0..置顶项数)，超出置顶区就贴着边界放。"""
+        pos = event.position().toPoint()
+        index = self.indexAt(pos)
+        if not index.isValid():
+            return self._pinned_rows
+        row = index.row()
+        if pos.y() > self.visualRect(index).center().y():
+            row += 1
+        return max(0, min(row, self._pinned_rows))
+
+    def dragEnterEvent(self, event):
+        if self._from_pinned(event):
+            super().dragEnterEvent(event)
+            self._slide_to(self._insert_at(event))
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if self._from_pinned(event):
+            super().dragMoveEvent(event)
+            self._slide_to(self._insert_at(event))
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event):
+        if self.is_reordering():
+            self._slide_to(self._drag_row)    # 移出列表: 空位退回原处
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event):
+        if not self._from_pinned(event):
+            event.ignore()
+            return
+        src = self.currentRow()
+        target = self._insert_at(event)
+        if target > src:
+            target -= 1                    # 源项被拿走后，它后面的位置整体前移一格
+        # 必须报 IgnoreAction：QAbstractItemView.startDrag 只要看到这趟拖放以
+        # MoveAction 收场，就会自己再把"被拖走的那几行"从列表里删掉。顺序是我们
+        # 自己重建的，它这一刀会多删一项，表现为拖完之后有台设备凭空不见了。
+        event.setDropAction(Qt.DropAction.IgnoreAction)
+        event.accept()
+        if target == src:
+            return
+        ips = [self.item(r).data(Qt.ItemDataRole.UserRole)
+               for r in range(self._pinned_rows)]
+        ips.insert(target, ips.pop(src))
+        self._pending_order = ips          # 由 _finish_drag 发出
 
 
 # ----------------------------- 主窗口 -----------------------------
@@ -7040,6 +7238,7 @@ class MainWindow(QMainWindow):
         self.staged_receives = _load_staged_receives()
         for ip, entries in self.staged_receives.items():
             self.known.setdefault(ip, {"name": entries[0].get("name", ip)})
+        self.pinned = self._load_pinned()      # 置顶设备的设备标识, 顺序即显示顺序
         self._peer_list_state = {}             # 用于跳过无变化的重绘
         self._recv_meta = {}                   # recv_id -> {ip, label} 进行中的接收
         self._bubbles_by_id = {}               # msg_id -> Bubble 组件（用于取消时撤回气泡）
@@ -7537,6 +7736,15 @@ class MainWindow(QMainWindow):
         except Exception as e:
             _log_persist_error("保存设备列表", e)
 
+    def _load_pinned(self):
+        """置顶列表。存的是 _device_key 给出的设备标识而不是 IP：对端换了 IP、
+        或者离线以后再上线，置顶都还认得是同一台。"""
+        v = get_setting("pinned_peers", [])
+        return [k for k in v if isinstance(k, str)] if isinstance(v, list) else []
+
+    def _save_pinned(self):
+        set_setting("pinned_peers", self.pinned)
+
     # ---------- UI ----------
     def _build_ui(self):
         root = QWidget()
@@ -7649,11 +7857,14 @@ class MainWindow(QMainWindow):
         dev_hdr.addWidget(btn_web)
         sb.addLayout(dev_hdr)
 
-        self.peer_list = QListWidget()
+        self.peer_list = PeerListWidget()
         self.peer_list.currentItemChanged.connect(self._on_peer_selected)
+        self.peer_list.orderChanged.connect(self._on_peer_order_changed)
+        self.peer_list.dragFinished.connect(self._on_peer_drag_finished)
         self.peer_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.peer_list.customContextMenuRequested.connect(self._peer_context_menu)
-        self.peer_list.setToolTip("右键点击离线设备可将其删除")
+        self.peer_list.setToolTip(
+            "右键可置顶设备；置顶的设备可拖动调整上下顺序\n右键点击离线设备可将其删除")
         sb.addWidget(self.peer_list, 1)
 
         self.empty_hint = self._lbl("尚未发现设备\n确保对方也打开了 BitFerry", "emptyHint")
@@ -7903,12 +8114,43 @@ class MainWindow(QMainWindow):
         online = self._peer_online(ip)
         from PyQt6.QtWidgets import QMenu as _QMenu
         menu = _QMenu(self)
+        act_pin = menu.addAction(
+            "取消置顶" if self._is_pinned(ip) else "置顶")
+        menu.addSeparator()
         act_del = menu.addAction("删除设备")
         if online:
             act_del.setEnabled(False)
         chosen = menu.exec(self.peer_list.mapToGlobal(pos))
-        if chosen == act_del:
+        if chosen == act_pin:
+            self._toggle_pin(ip)
+        elif chosen == act_del:
             self._delete_peer(ip)
+
+    def _is_pinned(self, ip):
+        return self._device_key(ip) in self.pinned
+
+    def _toggle_pin(self, ip):
+        key = self._device_key(ip)
+        if key in self.pinned:
+            self.pinned.remove(key)
+        else:
+            self.pinned.append(key)        # 新置顶的排在已置顶的最后
+        self._save_pinned()
+        self._peer_list_state = {}
+        self._rebuild_peer_list()
+
+    def _on_peer_drag_finished(self):
+        """拖动期间列表不重建, 期间攒下的上下线变化在这里补上。"""
+        self._peer_list_state = {}
+        self._rebuild_peer_list()
+
+    def _on_peer_order_changed(self, ips):
+        """拖动置顶项之后落盘新顺序。传进来的是列表里的代表 IP，按设备标识记。"""
+        keys = [self._device_key(ip) for ip in ips]
+        self.pinned = keys + [k for k in self.pinned if k not in keys]
+        self._save_pinned()
+        self._peer_list_state = {}
+        self._rebuild_peer_list()
 
     def _stored_message_count(self, ips, devs):
         """该设备在历史库里的记录条数；数不出来时返回 None，由调用方含糊其辞。"""
@@ -7983,6 +8225,9 @@ class MainWindow(QMainWindow):
                 self.session.pop(addr, None)
         self.unread.pop(identity, None)
         self._drafts.pop(identity, None)
+        if identity in self.pinned:
+            self.pinned.remove(identity)
+            self._save_pinned()
         if self.current_ip in aliases:
             self.current_ip = None
             self._draft_key = None
@@ -8096,6 +8341,10 @@ class MainWindow(QMainWindow):
             return False
 
     def _rebuild_peer_list(self):
+        if self.peer_list.is_reordering():
+            # 正在拖动：此刻 clear() 会把拖放状态连同动画中的 widget 一起销毁。
+            # 不更新 _peer_list_state，拖完 dragFinished 会重建一次补上。
+            return
         all_ips = set(self.known.keys()) | set(self.online.keys())
 
         # 把同一台设备的多个 IP 归并为一组，每组只挑一个代表 IP 显示
@@ -8112,7 +8361,11 @@ class MainWindow(QMainWindow):
         def sort_key(ip):
             on = self.online.get(ip, {}).get("online", False)
             nm = self.online.get(ip, {}).get("name") or self.known.get(ip, {}).get("name", ip)
-            return (0 if on else 1, nm.lower())
+            key = self._device_key(ip)
+            if key in self.pinned:
+                # 置顶的一律排在最前, 彼此按用户拖出来的顺序, 离线也不往下掉
+                return (0, self.pinned.index(key), "")
+            return (1, 0 if on else 1, nm.lower())
 
         sorted_ips = sorted(rep_ips, key=sort_key)
 
@@ -8123,6 +8376,7 @@ class MainWindow(QMainWindow):
                 self.online.get(ip, {}).get("online", False),
                 self.unread.get(self._device_key(ip), 0),
                 self._queued_count(ip),
+                self._device_key(ip) in self.pinned,
             )
             for ip in sorted_ips
         }
@@ -8134,18 +8388,28 @@ class MainWindow(QMainWindow):
         self.peer_list.blockSignals(True)
         self.peer_list.clear()
         select_item = None
+        pinned_rows = 0
         for ip in sorted_ips:
-            name, online, unread, queued = new_state[ip]
+            name, online, unread, queued, pinned = new_state[ip]
             item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, ip)
             item.setSizeHint(QSize(0, 56))
+            # 拖动只在置顶那几项之间进行; 谁都不当放置目标, 免得拖成"放进某一项里"
+            flags = item.flags() & ~Qt.ItemFlag.ItemIsDropEnabled
+            if pinned:
+                pinned_rows += 1
+                flags |= Qt.ItemFlag.ItemIsDragEnabled
+            else:
+                flags &= ~Qt.ItemFlag.ItemIsDragEnabled
+            item.setFlags(flags)
             self.peer_list.addItem(item)
             self.peer_list.setItemWidget(
-                item, PeerItem(name, self._display_ip(ip), online, unread, queued))
+                item, PeerItem(name, self._display_ip(ip), online, unread, queued, pinned))
             # 按设备(而非具体 IP)保持选中：对端代表 IP 变化时，选中态随之迁移到
             # 新的可达 IP，setCurrentItem 会触发 _on_peer_selected 更新 current_ip。
             if prev and self._device_key(ip) == self._device_key(prev):
                 select_item = item
+        self.peer_list.set_pinned_rows(pinned_rows)
         self.peer_list.blockSignals(False)
         if select_item:
             self.peer_list.setCurrentItem(select_item)

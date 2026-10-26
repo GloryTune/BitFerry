@@ -11,6 +11,38 @@ from unittest.mock import Mock, patch
 from test_reliability import app
 
 
+class _StubDrop:
+    """只喂 dropEvent 用到的那几个方法，省得伪造一整趟真实拖放。"""
+
+    def __init__(self, widget, y):
+        self._widget = widget
+        self._pos = app.QPointF(10, y)
+        self.action = app.Qt.DropAction.MoveAction
+        self.accepted = None
+
+    def source(self): return self._widget
+    def position(self): return self._pos
+    def setDropAction(self, action): self.action = action
+    def accept(self): self.accepted = True
+    def ignore(self): self.accepted = False
+
+
+class _StubDrag:
+    """顶掉 QDrag：真的 exec 会开一个内部事件循环一直等到用户松手。"""
+
+    last = None
+
+    def __init__(self, source):
+        self.source = source
+        self.mime = self.pixmap = self.hotspot = None
+        _StubDrag.last = self
+
+    def setMimeData(self, mime): self.mime = mime
+    def setPixmap(self, pixmap): self.pixmap = pixmap
+    def setHotSpot(self, point): self.hotspot = point
+    def exec(self, actions): return app.Qt.DropAction.IgnoreAction
+
+
 class ProductTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -1011,6 +1043,162 @@ class ProductTests(unittest.TestCase):
         self.assertEqual([b.text() for b in canvas._size_btns], ['小', '中', '大'])
         self.assertEqual([b.isChecked() for b in canvas._size_btns], [False, False, True])
         self.assertAlmostEqual(ann.font.pointSizeF() * canvas._scale, 32)
+
+    # ---------- 设备置顶 ----------
+    def pin_setup(self, *pinned):
+        """三台设备：Bravo 在线，Alpha 和 Cosmo 离线。"""
+        self.w.known = {'192.168.1.2': {'name': 'Alpha', 'uid': 'a'},
+                        '192.168.1.3': {'name': 'Bravo', 'uid': 'b'},
+                        '192.168.1.4': {'name': 'Cosmo', 'uid': 'c'}}
+        self.w.online = {'192.168.1.3': {'name': 'Bravo', 'uid': 'b', 'online': True}}
+        self.w.peer_list.resize(240, 400)
+        self.w._peer_list_state = {}
+        self.w._rebuild_peer_list()
+        for ip in pinned:
+            self.w._toggle_pin(ip)
+        return self.w.peer_list
+
+    def peer_order(self):
+        lst = self.w.peer_list
+        return [lst.item(r).data(app.Qt.ItemDataRole.UserRole) for r in range(lst.count())]
+
+    def peer_row_bottom(self, row):
+        """该行下半部分的一个 y 坐标：落在这里表示插到它后面。"""
+        return self.w.peer_list.visualItemRect(self.w.peer_list.item(row)).center().y() + 5
+
+    def peer_drop(self, src_row, y):
+        """走一遍 起拖 → 放下 → 收尾。真实拖放由 Qt 的内部事件循环驱动，这里把我们
+        接管的那几步按同样顺序调一遍。"""
+        lst = self.w.peer_list
+        lst.setCurrentRow(src_row)
+        lst._begin_reorder(src_row, lst.visualItemRect(lst.item(src_row)))
+        event = _StubDrop(lst, y)
+        lst.dropEvent(event)
+        lst._finish_drag()
+        self.qt.processEvents()
+        return event
+
+    def settle_slides(self, lst):
+        """把让位动画一次性推到终点，好对位置做断言。"""
+        for anim in lst._slides.values():
+            anim.setCurrentTime(anim.duration())
+        return [lst.itemWidget(lst.item(r)).pos() for r in range(lst._pinned_rows)]
+
+    def test_pinned_devices_stay_on_top_even_offline(self):
+        """置顶按设备标识记，所以对端离线、换 IP 都还认得是同一台。"""
+        lst = self.pin_setup()
+        self.assertEqual(self.peer_order(),
+                         ['192.168.1.3', '192.168.1.2', '192.168.1.4'])   # 在线的在前
+        self.w._toggle_pin('192.168.1.4')
+        self.w._toggle_pin('192.168.1.2')
+        # 两台都离线, 但置顶把它们按人工顺序顶在了在线设备前面
+        self.assertEqual(self.peer_order(),
+                         ['192.168.1.4', '192.168.1.2', '192.168.1.3'])
+        self.assertEqual(lst._pinned_rows, 2)
+        self.assertEqual(app.get_setting('pinned_peers'), ['uid:c', 'uid:a'])
+        # 只有置顶项能拖, 谁都不当放置目标(免得拖成"放进某一项里")
+        flags = [lst.item(r).flags() for r in range(3)]
+        self.assertTrue(all(f & app.Qt.ItemFlag.ItemIsDragEnabled for f in flags[:2]))
+        self.assertFalse(flags[2] & app.Qt.ItemFlag.ItemIsDragEnabled)
+        self.assertTrue(all(not (f & app.Qt.ItemFlag.ItemIsDropEnabled) for f in flags))
+        self.w._toggle_pin('192.168.1.4')
+        self.assertEqual(self.peer_order(),
+                         ['192.168.1.2', '192.168.1.3', '192.168.1.4'])
+
+    def test_pin_order_survives_restart(self):
+        self.pin_setup('192.168.1.4', '192.168.1.2')
+        other = app.MainWindow()
+        self.addCleanup(other.deleteLater)
+        other._draft_timer.stop()
+        other._draft_writer.close()
+        other._diagnostics.close()
+        other.known = dict(self.w.known)
+        other._peer_list_state = {}
+        other._rebuild_peer_list()
+        rows = [other.peer_list.item(r).data(app.Qt.ItemDataRole.UserRole)
+                for r in range(2)]
+        self.assertEqual(rows, ['192.168.1.4', '192.168.1.2'])
+
+    def test_drag_reorders_pinned_without_losing_a_device(self):
+        """QAbstractItemView.startDrag 看到拖放以 MoveAction 收场, 会自己再把拖走的
+        那几行删掉。顺序是我们自己重建的, 它那一刀会多删一项——拖完少一台设备。"""
+        self.pin_setup('192.168.1.2', '192.168.1.4')
+        event = self.peer_drop(0, self.peer_row_bottom(1))
+        self.assertEqual(event.action, app.Qt.DropAction.IgnoreAction)
+        self.assertTrue(event.accepted)
+        self.assertEqual(self.peer_order(),
+                         ['192.168.1.4', '192.168.1.2', '192.168.1.3'])
+        self.assertEqual(self.w.peer_list.count(), 3)
+        self.assertEqual(app.get_setting('pinned_peers'), ['uid:c', 'uid:a'])
+        # 拖到未置顶的那行下面: 夹回置顶区末位, 不许掉出置顶
+        self.peer_drop(0, self.peer_row_bottom(2))
+        self.assertEqual(self.peer_order(),
+                         ['192.168.1.2', '192.168.1.4', '192.168.1.3'])
+        self.assertEqual(self.w.peer_list.count(), 3)
+        for row in range(3):
+            self.assertIsNotNone(self.w.peer_list.itemWidget(self.w.peer_list.item(row)))
+
+    def test_other_rows_slide_aside_to_show_where_it_lands(self):
+        """拖动时其余置顶行滑开让出空位，空位在哪松手就落在哪。"""
+        lst = self.pin_setup('192.168.1.2', '192.168.1.3', '192.168.1.4')
+        home = [lst.visualItemRect(lst.item(r)).topLeft() for r in range(3)]
+        lst.setCurrentRow(0)
+        lst._begin_reorder(0, lst.visualItemRect(lst.item(0)))
+        self.assertTrue(lst.itemWidget(lst.item(0)).isHidden())   # 被"拎"起来了
+        lst._slide_to(3)                      # 拖到最后: 后两行各上移一格
+        pos = self.settle_slides(lst)
+        self.assertEqual([pos[1], pos[2]], [home[0], home[1]])
+        lst._slide_to(0)                      # 回到原处: 各归各位
+        pos = self.settle_slides(lst)
+        self.assertEqual([pos[1], pos[2]], [home[1], home[2]])
+        lst._finish_drag()
+        self.qt.processEvents()
+        self.assertEqual(lst._slides, {})
+        for row in range(lst.count()):
+            self.assertFalse(lst.itemWidget(lst.item(row)).isHidden())
+
+    def test_peer_list_is_not_rebuilt_mid_drag(self):
+        """重建会 clear() 掉所有项，把正在动画的 widget 连同拖放状态一起销毁。"""
+        lst = self.pin_setup('192.168.1.2', '192.168.1.4')
+        lst.setCurrentRow(0)
+        lst._begin_reorder(0, lst.visualItemRect(lst.item(0)))
+        before = [lst.item(r) for r in range(lst.count())]
+        self.w.online['192.168.1.2'] = {'name': 'Alpha', 'uid': 'a', 'online': True}
+        self.w._rebuild_peer_list()
+        self.assertEqual([lst.item(r) for r in range(lst.count())], before)
+        lst._finish_drag()                    # 拖完把期间攒下的变化补上
+        self.qt.processEvents()
+        self.assertNotEqual([lst.item(r) for r in range(lst.count())], before)
+        self.assertEqual(lst.count(), 3)
+
+    def test_dragged_row_is_visible_under_the_cursor(self):
+        """每行的内容挂在 itemWidget 上, delegate 什么也没画, 所以框架默认那张拖拽图
+        是空白的——得自己从 viewport 上把这一行截下来。"""
+        lst = self.pin_setup('192.168.1.2', '192.168.1.4')
+        lst.setCurrentRow(1)
+        with patch.object(app, 'QDrag', _StubDrag):
+            lst.startDrag(app.Qt.DropAction.MoveAction)
+        drag = _StubDrag.last
+        self.assertIsNotNone(drag.mime)
+        self.assertFalse(drag.pixmap.isNull())
+        self.assertEqual(drag.pixmap.size(),
+                         lst.visualItemRect(lst.item(1)).size() * drag.pixmap.devicePixelRatio())
+        self.assertFalse(lst.is_reordering())          # exec 返回后收干净
+        _StubDrag.last = None
+        lst.setCurrentRow(2)                           # 没置顶的那行拖不动
+        with patch.object(app, 'QDrag', _StubDrag):
+            lst.startDrag(app.Qt.DropAction.MoveAction)
+        self.assertIsNone(_StubDrag.last)
+
+    def test_deleting_a_device_also_unpins_it(self):
+        self.pin_setup('192.168.1.4')
+        with patch.object(app.QMessageBox, 'exec', lambda box: None), \
+             patch.object(app.QMessageBox, 'clickedButton',
+                          lambda box: next(b for b in box.buttons()
+                                           if b.text().replace('&', '') == '删除')):
+            self.w._delete_peer('192.168.1.4')
+        self.assertEqual(self.w.pinned, [])
+        self.assertEqual(app.get_setting('pinned_peers'), [])
 
 
 if __name__ == '__main__':
